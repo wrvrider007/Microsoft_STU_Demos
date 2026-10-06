@@ -28,7 +28,16 @@
     One or more partner tenant IDs (GUIDs). Used directly.
 
 .PARAMETER Environment
-    Graph/cloud environment. One of: Global, USGov, USGovDoD, Custom. Default Global.
+    Cloud/endpoint name to deploy against. Global, USGov, and USGovDoD are built in;
+    any other name (e.g. a sovereign/AGC cloud) must be defined in a clouds.json file
+    (see -CloudConfigPath and ReadMEs/CloudShellDeployment.md). Default Global.
+
+.PARAMETER CloudConfigPath
+    Optional path to a clouds.json defining named cloud endpoints
+    ({ "clouds": { "<name>": { graphEndpoint, loginHost, mgEnvironment, azCloud } } }).
+    If omitted, the script searches ..\Config\clouds.json, .\Config\clouds.json, and
+    clouds.json beside the script (the last covers flat Azure Cloud Shell uploads).
+    File entries override the built-in Global/USGov/USGovDoD definitions of the same name.
 
 .PARAMETER AccessToken
     A pre-acquired Microsoft Graph access token (SecureString) to authenticate with, instead of
@@ -58,22 +67,11 @@
 param(
     [Parameter(Mandatory = $true)]
     [string] $TemplatePath,
-
     [string[]] $Domain,
-
     [string[]] $TenantId,
-
-    [ValidateSet('Global', 'USGov', 'USGovDoD', 'Custom')]
     [string] $Environment = 'Global',
-
-    [string] $CustomGraphEndpoint,
-
-    [string] $CustomLoginHost,
-
-    [string] $CustomMgEnvironment = 'Global',
-
+    [string] $CloudConfigPath,
     [securestring] $AccessToken,
-
     [switch] $StopOnError
 )
 
@@ -81,24 +79,86 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 # ---------------------------------------------------------------------------
-# Environment / endpoint map
+# Tunable constants
 # ---------------------------------------------------------------------------
-$EnvMap = @{
-    Global   = @{ GraphEndpoint = 'https://graph.microsoft.com';         Login = 'login.microsoftonline.com'; MgEnvironment = 'Global'   }
-    USGov    = @{ GraphEndpoint = 'https://graph.microsoft.us';           Login = 'login.microsoftonline.us';  MgEnvironment = 'USGov'    }
-    USGovDoD = @{ GraphEndpoint = 'https://dod-graph.microsoft.us';       Login = 'login.microsoftonline.us';  MgEnvironment = 'USGovDoD' }
+$script:JsonBodyDepth             = 40   # ConvertTo-Json depth when serializing request bodies
+$script:CreateRetryDelaySeconds   = 15   # default backoff between create retries (directory replication lag)
+$script:RoleScopePollAttempts     = 12   # roleScope: number of times to poll for the target resource to appear
+$script:RoleScopePollDelaySeconds = 5    # roleScope: delay between polls
+
+# True when a parsed-JSON node (PSCustomObject) declares the named property. Replaces the
+# repeated '$obj.PSObject.Properties.Name -contains "name"' idiom for readability.
+function Test-HasKey {
+    param([object] $Object, [string] $Key)
+    return ($null -ne $Object) -and ($Object.PSObject.Properties.Name -contains $Key)
 }
-if ($Environment -eq 'Custom') {
-    if (-not $CustomGraphEndpoint -or -not $CustomLoginHost) {
-        throw "-Environment Custom requires -CustomGraphEndpoint and -CustomLoginHost (e.g. an Azure Government/sovereign or AGC endpoint)."
-    }
-    $EnvMap['Custom'] = @{ GraphEndpoint = $CustomGraphEndpoint.TrimEnd('/'); Login = $CustomLoginHost; MgEnvironment = $CustomMgEnvironment }
-}
-$EnvCfg       = $EnvMap[$Environment]
-$GraphEndpoint = $EnvCfg.GraphEndpoint
-$LoginHost     = $EnvCfg.Login
 
 # ---------------------------------------------------------------------------
+# Cloud / endpoint resolution
+#
+# Cloud definitions (Graph endpoint, login host, Graph SDK environment, Azure CLI
+# cloud name) come from a clouds.json file so sovereign/AGC endpoints live in config
+# instead of script parameters. The three public clouds are also defined in-script as
+# a fallback, so a clouds.json is only REQUIRED for a custom/sovereign cloud name.
+#
+# clouds.json search order:
+#   1. -CloudConfigPath (explicit)
+#   2. <script>\..\Config\clouds.json   (repo layout: Scripts\ beside Config\)
+#   3. <script>\Config\clouds.json
+#   4. <script>\clouds.json             (flat Azure Cloud Shell upload)
+# File entries override built-ins of the same name.
+# ---------------------------------------------------------------------------
+$BuiltInClouds = @{
+    Global   = @{ graphEndpoint = 'https://graph.microsoft.com';   loginHost = 'login.microsoftonline.com'; mgEnvironment = 'Global';   azCloud = 'AzureCloud' }
+    USGov    = @{ graphEndpoint = 'https://graph.microsoft.us';     loginHost = 'login.microsoftonline.us';  mgEnvironment = 'USGov';    azCloud = 'AzureUSGovernment' }
+    USGovDoD = @{ graphEndpoint = 'https://dod-graph.microsoft.us'; loginHost = 'login.microsoftonline.us';  mgEnvironment = 'USGovDoD'; azCloud = 'AzureUSGovernment' }
+}
+
+function Resolve-CloudConfig {
+    param([Parameter(Mandatory = $true)][string] $Name, [string] $ConfigPath)
+
+    $candidates = @()
+    if ($ConfigPath) { $candidates += $ConfigPath }
+    if ($PSScriptRoot) {
+        $candidates += (Join-Path (Split-Path $PSScriptRoot -Parent) 'Config/clouds.json')
+        $candidates += (Join-Path $PSScriptRoot 'Config/clouds.json')
+        $candidates += (Join-Path $PSScriptRoot 'clouds.json')
+    }
+
+    $fileClouds = @{}
+    $foundPath  = $null
+    foreach ($c in $candidates) {
+        if ($c -and (Test-Path -LiteralPath $c)) { $foundPath = $c; break }
+    }
+    if ($foundPath) {
+        try { $doc = Get-Content -Raw -LiteralPath $foundPath | ConvertFrom-Json }
+        catch { throw "Cloud config '$foundPath' is not valid JSON: $($_.Exception.Message)" }
+        $node = if (Test-HasKey $doc 'clouds') { $doc.clouds } else { $doc }
+        foreach ($p in $node.PSObject.Properties) {
+            if ($p.Name -eq '$schema') { continue }
+            $h = @{}
+            foreach ($f in $p.Value.PSObject.Properties) { $h[$f.Name] = $f.Value }
+            $fileClouds[$p.Name] = $h
+        }
+    }
+
+    if     ($fileClouds.ContainsKey($Name))    { $entry = $fileClouds[$Name] }
+    elseif ($BuiltInClouds.ContainsKey($Name)) { $entry = $BuiltInClouds[$Name] }
+    else {
+        $known    = ((@($BuiltInClouds.Keys) + @($fileClouds.Keys)) | Select-Object -Unique | Sort-Object) -join ', '
+        $searched = ($candidates | Where-Object { $_ }) -join '; '
+        throw "Unknown -Environment '$Name'. Known clouds: $known. Define a custom/sovereign cloud in a clouds.json (searched: $searched)."
+    }
+    if ($entry.graphEndpoint) { $entry.graphEndpoint = ([string]$entry.graphEndpoint).TrimEnd('/') }
+    return $entry
+}
+
+$EnvCfg        = Resolve-CloudConfig -Name $Environment -ConfigPath $CloudConfigPath
+$GraphEndpoint = $EnvCfg.graphEndpoint
+$LoginHost     = $EnvCfg.loginHost
+if (-not $GraphEndpoint -or -not $LoginHost -or -not $EnvCfg.mgEnvironment) {
+    throw "Cloud '$Environment' must define graphEndpoint, loginHost, and mgEnvironment (check your clouds.json)."
+}
 # Console reporting helpers
 # ---------------------------------------------------------------------------
 $script:Summary = [ordered]@{ Created = 0; Found = 0; Applied = 0; Skipped = 0; WhatIf = 0; Asserted = 0; Warning = 0; Error = 0 }
@@ -170,40 +230,41 @@ function Build-Partners {
 }
 
 # ---------------------------------------------------------------------------
-# JMESPath-lite: resolve a small subset of match/capture expressions
-#   supported: seg.seg2 , seg[0] , value[?prop] , value[?prop]|[0]
+# JMESPath-lite path evaluator (renamed from Resolve-Path to avoid shadowing the
+# built-in Resolve-Path cmdlet). Resolves a small subset of match/capture expressions:
+#   seg.seg2 , seg[0] , value[?prop] , value[?prop=='literal'] , value|[0]
 # ---------------------------------------------------------------------------
-function Resolve-Path {
+function Get-JmesValue {
     param([object] $Obj, [string] $Expr)
     if ([string]::IsNullOrWhiteSpace($Expr)) { return $Obj }
     $current = $Obj
     # split on pipe first (only "|[0]" style supported)
-    $pipeParts = $Expr -split '\|'
-    foreach ($part in $pipeParts) {
-        $part = $part.Trim()
+    $pipeStages = $Expr -split '\|'
+    foreach ($stage in $pipeStages) {
+        $stage = $stage.Trim()
         # tokenize dotted path with optional [..]
-        foreach ($seg in ($part -split '\.')) {
+        foreach ($seg in ($stage -split '\.')) {
             if ([string]::IsNullOrWhiteSpace($seg)) { continue }
             if ($null -eq $current) { return $null }
             # equality filter: name[?prop=='value']  (single-quoted literal)
             if ($seg -match "^([A-Za-z0-9_]+)\[\?([A-Za-z0-9_]+)\s*==\s*'(.*)'\]$") {
-                $prop = $Matches[1]; $pred = $Matches[2]; $lit = $Matches[3]
-                $coll = if ($prop) { $current.$prop } else { $current }
-                $current = @($coll | Where-Object { $_.PSObject.Properties.Name -contains $pred -and $_.$pred -eq $lit })
+                $propName = $Matches[1]; $predProp = $Matches[2]; $literal = $Matches[3]
+                $collection = if ($propName) { $current.$propName } else { $current }
+                $current = @($collection | Where-Object { (Test-HasKey $_ $predProp) -and $_.$predProp -eq $literal })
                 continue
             }
             # filter: name[?prop]  (truthy)
             if ($seg -match '^([A-Za-z0-9_]+)\[\?([A-Za-z0-9_]+)\]$') {
-                $prop = $Matches[1]; $pred = $Matches[2]
-                $coll = if ($prop) { $current.$prop } else { $current }
-                $current = @($coll | Where-Object { $_.PSObject.Properties.Name -contains $pred -and $_.$pred })
+                $propName = $Matches[1]; $predProp = $Matches[2]
+                $collection = if ($propName) { $current.$propName } else { $current }
+                $current = @($collection | Where-Object { (Test-HasKey $_ $predProp) -and $_.$predProp })
                 continue
             }
             # index: name[0]  or bare [0]
             if ($seg -match '^([A-Za-z0-9_]*)\[(\d+)\]$') {
-                $prop = $Matches[1]; $idx = [int]$Matches[2]
-                $coll = if ($prop) { $current.$prop } else { $current }
-                $current = if ($null -ne $coll -and @($coll).Count -gt $idx) { @($coll)[$idx] } else { $null }
+                $propName = $Matches[1]; $index = [int]$Matches[2]
+                $collection = if ($propName) { $current.$propName } else { $current }
+                $current = if ($null -ne $collection -and @($collection).Count -gt $index) { @($collection)[$index] } else { $null }
                 continue
             }
             # plain property
@@ -263,7 +324,7 @@ function Get-ContextValue {
         if ($null -eq $cur) { return $null }
         $seg = $parts[$i]
         if ($cur -is [System.Collections.IDictionary]) { $cur = $cur[$seg] }
-        elseif ($cur.PSObject.Properties.Name -contains $seg) { $cur = $cur.$seg }
+        elseif (Test-HasKey $cur $seg) { $cur = $cur.$seg }
         else { return $null }
     }
     return $cur
@@ -281,17 +342,17 @@ function Invoke-Graph {
         [int[]]  $ExpectedStatuses = @()
     )
     $params = @{ Method = $Method; Uri = $Uri; OutputType = 'PSObject' }
-    if ($Body) { $params.Body = ($Body | ConvertTo-Json -Depth 40); $params.ContentType = 'application/json' }
+    if ($Body) { $params.Body = ($Body | ConvertTo-Json -Depth $script:JsonBodyDepth); $params.ContentType = 'application/json' }
     try {
-        $resp = Invoke-MgGraphRequest @params
-        return @{ Ok = $true; Status = 200; Body = $resp }
+        $response = Invoke-MgGraphRequest @params
+        return @{ Ok = $true; Status = 200; Body = $response }
     } catch {
         $status = $null
-        $ex = $_.Exception
-        if ($ex.PSObject.Properties.Name -contains 'Response' -and $ex.Response) {
-            try { $status = [int]$ex.Response.StatusCode } catch {}
+        $exception = $_.Exception
+        if ((Test-HasKey $exception 'Response') -and $exception.Response) {
+            try { $status = [int]$exception.Response.StatusCode } catch {}
         }
-        $detail = "$($_.ErrorDetails.Message) $($ex.Message)"
+        $detail = "$($_.ErrorDetails.Message) $($exception.Message)"
         if ($null -eq $status -and $_.ErrorDetails.Message -match '"code"') { $status = 400 }
         if ($ExpectedStatuses -contains $status) {
             return @{ Ok = $false; Status = $status; Body = $null; Detail = $detail }
@@ -331,7 +392,7 @@ function Invoke-Resource {
 
     # ---- requires ---- skip this resource if a prerequisite context value is absent
     # (e.g. a sync step that needs {{spId}} when the sync app was intentionally skipped)
-    if ($Res.PSObject.Properties.Name -contains 'requires') {
+    if (Test-HasKey $Res 'requires') {
         foreach ($req in @($Res.requires)) {
             if (-not $ctx.ContainsKey($req) -or $null -eq $ctx[$req] -or [string]::IsNullOrEmpty([string]$ctx[$req])) {
                 Write-Action Skipped "$displayName - skipped (prerequisite '$req' not available)"
@@ -343,33 +404,31 @@ function Invoke-Resource {
     # ---- exists ---- (supports a single lookup object OR an ordered array of
     # lookups tried in sequence; first one that yields a match wins)
     $found = $null
-    if ($Res.PSObject.Properties.Name -contains 'exists') {
+    if (Test-HasKey $Res 'exists') {
         $lookups = @($Res.exists)
-        foreach ($ex in $lookups) {
-            $uri = [string](Resolve-Tokens -InputObject $ex.uri -Context $ctx -Tolerant:([bool]$WhatIfPreference))
+        foreach ($lookup in $lookups) {
+            $uri = [string](Resolve-Tokens -InputObject $lookup.uri -Context $ctx -Tolerant:([bool]$WhatIfPreference))
             if ($uri -match '<unresolved:') {
                 Write-Action WhatIf "$displayName - exists check skipped (depends on an object not yet created)"
                 Write-Verbose "$displayName : skipped exists GET $uri"
                 return $ctx
             }
-            $expected = @()
-            if ($ex.PSObject.Properties.Name -contains 'notFoundStatuses') { $expected = @($ex.notFoundStatuses) }
-            else { $expected = @(404) }
-            Write-Verbose "$displayName : $($ex.method) $uri"
-            $r = Invoke-Graph -Method $ex.method -Uri $uri -ExpectedStatuses $expected
+            $expected = if (Test-HasKey $lookup 'notFoundStatuses') { @($lookup.notFoundStatuses) } else { @(404) }
+            Write-Verbose "$displayName : $($lookup.method) $uri"
+            $response = Invoke-Graph -Method $lookup.method -Uri $uri -ExpectedStatuses $expected
             $hit = $null
-            if ($r.Ok) {
-                if ($ex.PSObject.Properties.Name -contains 'match') {
-                    $matchExpr = [string](Resolve-Tokens -InputObject $ex.match -Context $ctx -Tolerant)
-                    $hit = Resolve-Path -Obj $r.Body -Expr $matchExpr
+            if ($response.Ok) {
+                if (Test-HasKey $lookup 'match') {
+                    $matchExpr = [string](Resolve-Tokens -InputObject $lookup.match -Context $ctx -Tolerant)
+                    $hit = Get-JmesValue -Obj $response.Body -Expr $matchExpr
                 }
-                else { $hit = $r.Body }
+                else { $hit = $response.Body }
             }
             if ($hit) {
                 $found = $hit
                 $ctx['exists'] = $found
-                if ($ex.PSObject.Properties.Name -contains 'capture') {
-                    foreach ($cp in $ex.capture.PSObject.Properties) { $ctx[$cp.Name] = Resolve-Path -Obj $r.Body -Expr $cp.Value }
+                if (Test-HasKey $lookup 'capture') {
+                    foreach ($captureProp in $lookup.capture.PSObject.Properties) { $ctx[$captureProp.Name] = Get-JmesValue -Obj $response.Body -Expr $captureProp.Value }
                 }
                 break
             }
@@ -379,63 +438,65 @@ function Invoke-Resource {
     # ---- assert mode ----
     if ($mode -eq 'assert') {
         if (-not $found) { Write-Action Skipped "$displayName - precondition clear (no restrictive policy found)"; return $ctx }
-        $pred = $Res.assert.predicate
-        $raw  = Resolve-Path -Obj $found -Expr $pred.path
-        if (($pred.PSObject.Properties.Name -contains 'decode') -and $pred.decode -eq 'json' -and $raw) { $raw = ($raw | ConvertFrom-Json) }
-        $sel = if ($raw) { Resolve-Path -Obj $raw -Expr $pred.select } else { $null }
-        $isEmpty = ($null -eq $sel) -or (@($sel).Count -eq 0)
-        if ($pred.mustBe -eq 'emptyOrAbsent' -and $isEmpty) {
-            Write-Action Asserted "$displayName - OK (no invite allow-list)"
+        $predicate = $Res.assert.predicate
+        $rawValue  = Get-JmesValue -Obj $found -Expr $predicate.path
+        if ((Test-HasKey $predicate 'decode') -and $predicate.decode -eq 'json' -and $rawValue) { $rawValue = ($rawValue | ConvertFrom-Json) }
+        $selected = if ($rawValue) { Get-JmesValue -Obj $rawValue -Expr $predicate.select } else { $null }
+        $isEmpty = ($null -eq $selected) -or (@($selected).Count -eq 0)
+        if ($predicate.mustBe -eq 'emptyOrAbsent' -and $isEmpty) {
+            Write-Action Asserted "$displayName - OK"
             return $ctx
         }
-        # predicate failed - warn only (relaxing is commercial-cloud only and out of scope)
-        $msgCtx = @{} + $ctx; $msgCtx['value'] = ($sel -join ', ')
+        # predicate failed - warn by default; allow templates to make safety preconditions fatal.
+        $msgCtx = @{} + $ctx; $msgCtx['value'] = ($selected -join ', ')
         $msg = [string](Resolve-Tokens -InputObject $Res.assert.onFail.message -Context $msgCtx -Tolerant)
+        $action = if ((Test-HasKey $Res.assert.onFail 'action') -and $Res.assert.onFail.action) { [string]$Res.assert.onFail.action } else { 'warn' }
+        if ($action -eq 'error') {
+            Write-Action Error $msg
+            throw $msg
+        }
         Write-Action Warning $msg
         return $ctx
     }
 
     # ---- create (create-if-missing) ----
-    $obj = $found
+    $object = $found
     if ($mode -eq 'create') {
         if ($found) {
             Write-Action Found "$displayName - already exists"
-            if ($Res.create.PSObject.Properties.Name -contains 'capture') {
-                # nothing to capture from create; try exists body already handled
-            }
         } else {
-            $cr = $Res.create
+            $createBlock = $Res.create
             # optional guard: detect pre-existing objects we must NOT duplicate or
             # touch (e.g. a manually-configured cross-tenant sync app). If the guard
             # GET returns a match, warn with remediation and skip creation.
-            if ($cr.PSObject.Properties.Name -contains 'guard') {
-                $g = $cr.guard
-                $guri = [string](Resolve-Tokens -InputObject $g.uri -Context $ctx -Tolerant:([bool]$WhatIfPreference))
-                if ($guri -notmatch '<unresolved:') {
-                    Write-Verbose "$displayName : guard GET $guri"
-                    $gr = Invoke-Graph -Method 'GET' -Uri $guri -ExpectedStatuses @(404)
-                    $gmatch = $null
-                    if ($gr.Ok) { $gmatch = if ($g.PSObject.Properties.Name -contains 'match') { Resolve-Path -Obj $gr.Body -Expr $g.match } else { $gr.Body } }
-                    if ($gmatch) {
-                        $gmsg = if ($g.PSObject.Properties.Name -contains 'message') { [string](Resolve-Tokens -InputObject $g.message -Context $ctx -Tolerant) } else { "$displayName - existing object(s) detected; skipping create to avoid duplicating or modifying unmanaged configuration." }
-                        Write-Action Warning $gmsg
+            if (Test-HasKey $createBlock 'guard') {
+                $guard = $createBlock.guard
+                $guardUri = [string](Resolve-Tokens -InputObject $guard.uri -Context $ctx -Tolerant:([bool]$WhatIfPreference))
+                if ($guardUri -notmatch '<unresolved:') {
+                    Write-Verbose "$displayName : guard GET $guardUri"
+                    $guardResponse = Invoke-Graph -Method 'GET' -Uri $guardUri -ExpectedStatuses @(404)
+                    $guardMatch = $null
+                    if ($guardResponse.Ok) { $guardMatch = if (Test-HasKey $guard 'match') { Get-JmesValue -Obj $guardResponse.Body -Expr $guard.match } else { $guardResponse.Body } }
+                    if ($guardMatch) {
+                        $guardMessage = if (Test-HasKey $guard 'message') { [string](Resolve-Tokens -InputObject $guard.message -Context $ctx -Tolerant) } else { "$displayName - existing object(s) detected; skipping create to avoid duplicating or modifying unmanaged configuration." }
+                        Write-Action Warning $guardMessage
                         return $ctx
                     }
                 }
             }
-            $uri  = [string](Resolve-Tokens -InputObject $cr.uri -Context $ctx)
-            $body = if ($cr.PSObject.Properties.Name -contains 'body') { Resolve-Tokens -InputObject $cr.body -Context $ctx -Tolerant:([bool]$WhatIfPreference) } else { $null }
-            Write-Verbose "$displayName : $($cr.method) $uri"
+            $uri  = [string](Resolve-Tokens -InputObject $createBlock.uri -Context $ctx)
+            $body = if (Test-HasKey $createBlock 'body') { Resolve-Tokens -InputObject $createBlock.body -Context $ctx -Tolerant:([bool]$WhatIfPreference) } else { $null }
+            Write-Verbose "$displayName : $($createBlock.method) $uri"
             if ($PSCmdlet.ShouldProcess($displayName, "create")) {
                 # optional retry-with-backoff for transient failures (e.g. directory
                 # replication lag when a just-created object isn't visible yet)
-                $retries = if ($cr.PSObject.Properties.Name -contains 'retryCount') { [int]$cr.retryCount } else { 0 }
-                $delay   = if ($cr.PSObject.Properties.Name -contains 'retryDelaySeconds') { [int]$cr.retryDelaySeconds } else { 15 }
+                $retries = if (Test-HasKey $createBlock 'retryCount') { [int]$createBlock.retryCount } else { 0 }
+                $delay   = if (Test-HasKey $createBlock 'retryDelaySeconds') { [int]$createBlock.retryDelaySeconds } else { $script:CreateRetryDelaySeconds }
                 $attempt = 0
-                $r = $null
+                $response = $null
                 while ($true) {
                     try {
-                        $r = Invoke-Graph -Method $cr.method -Uri $uri -Body $body
+                        $response = Invoke-Graph -Method $createBlock.method -Uri $uri -Body $body
                         break
                     } catch {
                         if ($attempt -ge $retries) { throw }
@@ -444,55 +505,55 @@ function Invoke-Resource {
                         Start-Sleep -Seconds $delay
                     }
                 }
-                $obj = $r.Body
+                $object = $response.Body
                 Write-Action Created "$displayName"
-                if ($cr.PSObject.Properties.Name -contains 'capture') {
-                    foreach ($cp in $cr.capture.PSObject.Properties) { $ctx[$cp.Name] = Resolve-Path -Obj $r.Body -Expr $cp.Value }
+                if (Test-HasKey $createBlock 'capture') {
+                    foreach ($captureProp in $createBlock.capture.PSObject.Properties) { $ctx[$captureProp.Name] = Get-JmesValue -Obj $response.Body -Expr $captureProp.Value }
                 }
             } else {
                 Write-Action WhatIf "$displayName - would create"
             }
         }
-        if ($obj) { $ctx['exists'] = $obj }
+        if ($object) { $ctx['exists'] = $object }
     }
 
     # store captureAs (found or created object) and register it for global promotion
-    if ($Res.PSObject.Properties.Name -contains 'captureAs' -and $obj) {
-        $ctx[$Res.captureAs] = $obj
+    if ((Test-HasKey $Res 'captureAs') -and $object) {
+        $ctx[$Res.captureAs] = $object
         if ($script:DynamicCaptureKeys -notcontains $Res.captureAs) { $script:DynamicCaptureKeys += $Res.captureAs }
     }
 
     # ---- configure (idempotent PATCH/PUT) ----
-    if ($Res.PSObject.Properties.Name -contains 'configure' -and $mode -ne 'assert') {
+    if ((Test-HasKey $Res 'configure') -and $mode -ne 'assert') {
         Invoke-Mutation -Block $Res.configure -Ctx $ctx -Target $displayName -Verb 'Applied' -ActionText 'configure'
     }
 
     # ---- roleScope (lookup + POST) ----
-    if ($Res.PSObject.Properties.Name -contains 'roleScope') {
-        $rs = $Res.roleScope
-        $lk = $rs.lookup
-        $luri = [string](Resolve-Tokens -InputObject $lk.uri -Context $ctx -Tolerant:([bool]$WhatIfPreference))
+    if (Test-HasKey $Res 'roleScope') {
+        $roleScope = $Res.roleScope
+        $lookupSpec = $roleScope.lookup
+        $lookupUri = [string](Resolve-Tokens -InputObject $lookupSpec.uri -Context $ctx -Tolerant:([bool]$WhatIfPreference))
         if ($WhatIfPreference) {
             Write-Action WhatIf "$displayName - would add resource role scope"
-            Write-Verbose "$displayName : lookup GET $luri"
+            Write-Verbose "$displayName : lookup GET $lookupUri"
         } else {
             # poll until resource appears
             $resolved = $null
-            for ($i = 0; $i -lt 12 -and -not $resolved; $i++) {
-                $lr = Invoke-Graph -Method $lk.method -Uri $luri
-                $resolved = Resolve-Path -Obj $lr.Body -Expr $lk.waitUntil
-                if (-not $resolved) { Start-Sleep -Seconds 5 }
+            for ($i = 0; $i -lt $script:RoleScopePollAttempts -and -not $resolved; $i++) {
+                $lookupResponse = Invoke-Graph -Method $lookupSpec.method -Uri $lookupUri
+                $resolved = Get-JmesValue -Obj $lookupResponse.Body -Expr $lookupSpec.waitUntil
+                if (-not $resolved) { Start-Sleep -Seconds $script:RoleScopePollDelaySeconds }
             }
             if (-not $resolved) { Write-Action Error "$displayName - resource role lookup timed out"; throw "roleScope lookup timeout for '$displayName'." }
             # rebuild nested roleScope.lookup context for token {{roleScope.lookup.<name>}}
-            $lookupCap = @{}
-            foreach ($cp in $lk.capture.PSObject.Properties) { $lookupCap[$cp.Name] = Resolve-Path -Obj $lr.Body -Expr $cp.Value }
-            $ctx['roleScope'] = @{ lookup = $lookupCap }
-            $uri  = [string](Resolve-Tokens -InputObject $rs.uri -Context $ctx)
-            $body = Resolve-Tokens -InputObject $rs.body -Context $ctx
-            Write-Verbose "$displayName : $($rs.method) $uri"
+            $lookupCaptures = @{}
+            foreach ($captureProp in $lookupSpec.capture.PSObject.Properties) { $lookupCaptures[$captureProp.Name] = Get-JmesValue -Obj $lookupResponse.Body -Expr $captureProp.Value }
+            $ctx['roleScope'] = @{ lookup = $lookupCaptures }
+            $uri  = [string](Resolve-Tokens -InputObject $roleScope.uri -Context $ctx)
+            $body = Resolve-Tokens -InputObject $roleScope.body -Context $ctx
+            Write-Verbose "$displayName : $($roleScope.method) $uri"
             if ($PSCmdlet.ShouldProcess($displayName, "add role scope")) {
-                Invoke-Graph -Method $rs.method -Uri $uri -Body $body -ExpectedStatuses @(400) | Out-Null
+                Invoke-Graph -Method $roleScope.method -Uri $uri -Body $body -ExpectedStatuses @(400) | Out-Null
                 Write-Action Applied "$displayName - resource role scope added"
             }
         }
@@ -504,8 +565,8 @@ function Invoke-Resource {
 function Invoke-Mutation {
     param([object] $Block, [hashtable] $Ctx, [string] $Target, [string] $Verb, [string] $ActionText)
     $uri  = [string](Resolve-Tokens -InputObject $Block.uri -Context $Ctx -Tolerant:([bool]$WhatIfPreference))
-    $body = if ($Block.PSObject.Properties.Name -contains 'body') { Resolve-Tokens -InputObject $Block.body -Context $Ctx -Tolerant:([bool]$WhatIfPreference) } else { $null }
-    $skipOnConflict = ($Block.PSObject.Properties.Name -contains 'skipOnConflict') -and $Block.skipOnConflict
+    $body = if (Test-HasKey $Block 'body') { Resolve-Tokens -InputObject $Block.body -Context $Ctx -Tolerant:([bool]$WhatIfPreference) } else { $null }
+    $skipOnConflict = (Test-HasKey $Block 'skipOnConflict') -and $Block.skipOnConflict
     Write-Verbose "$Target : $($Block.method) $uri"
     if ($PSCmdlet.ShouldProcess($Target, $ActionText)) {
         try {
@@ -551,59 +612,8 @@ function Merge-Captured {
 }
 
 # ---------------------------------------------------------------------------
-# Main
+# Access-token / scope helpers (used by Main when authenticating)
 # ---------------------------------------------------------------------------
-Write-Host ""
-Write-Host "=== Entra Template Provisioner ===" -ForegroundColor White
-
-if (-not (Test-Path $TemplatePath)) { throw "Template not found: $TemplatePath" }
-try {
-    $template = Get-Content $TemplatePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-} catch {
-    throw "Template '$TemplatePath' is not valid JSON: $($_.Exception.Message)"
-}
-if (-not ($template.PSObject.Properties.Name -contains 'resources') -or $null -eq $template.resources) {
-    throw "Template '$TemplatePath' is missing a 'resources' array."
-}
-
-# Normalize graphScopes into a delegated set and an application (app-role) set. Accepts either
-# the legacy flat array (treated as delegated only) or an object { delegated:[], application:[] }.
-# Delegated mode requests the delegated set; an app-only access token is validated against the
-# application set. This keeps app-only-only permissions (e.g. Directory.ReadWrite.All, which
-# substitutes the delegated GroupSettings.ReadWrite.All) out of the delegated consent request.
-$delegatedScopes  = @()
-$applicationRoles = @()
-if ($template.PSObject.Properties.Name -contains 'graphScopes' -and $null -ne $template.graphScopes) {
-    $gs = $template.graphScopes
-    if ($gs -is [System.Array] -or $gs -is [string]) {
-        $delegatedScopes = @($gs)
-    }
-    else {
-        if ($gs.PSObject.Properties.Name -contains 'delegated')   { $delegatedScopes  = @($gs.delegated) }
-        if ($gs.PSObject.Properties.Name -contains 'application') { $applicationRoles = @($gs.application) }
-    }
-}
-
-$tplName = if ($template.PSObject.Properties.Name -contains 'template') { $template.template } else { [IO.Path]::GetFileNameWithoutExtension($TemplatePath) }
-$tplVer  = if ($template.PSObject.Properties.Name -contains 'version') { $template.version } else { 'n/a' }
-$tplDate = if ($template.PSObject.Properties.Name -contains 'updated') { $template.updated } else { 'n/a' }
-Write-Host "Template    : $tplName v$tplVer (updated $tplDate)"
-Write-Host "File        : $TemplatePath"
-Write-Host "Environment : $Environment ($GraphEndpoint)"
-Write-Host "WhatIf      : $([bool]$WhatIfPreference)"
-if ($template.PSObject.Properties.Name -contains 'description') { Write-Host "Description : $($template.description)" -ForegroundColor DarkGray }
-Write-Host ""
-
-# Build partner list from inputs
-$partners = Build-Partners
-Write-Host ""
-Write-Action Info ("Partners: {0}" -f (($partners | ForEach-Object { "$($_.displayName)=$($_.tenantId)" }) -join '; '))
-
-# Connect
-if (-not (Get-Module Microsoft.Graph.Authentication -ListAvailable)) {
-    throw "Microsoft.Graph.Authentication module not found. Install-Module Microsoft.Graph -Scope CurrentUser"
-}
-Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
 
 # Decode the payload (claims) of a JWT without validation. Used to read the granted
 # delegated scopes ('scp') or application roles ('roles') from an access token.
@@ -638,6 +648,61 @@ function Test-ScopeSatisfied {
     return $false
 }
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+Write-Host ""
+Write-Host "=== Entra Template Provisioner ===" -ForegroundColor White
+
+if (-not (Test-Path $TemplatePath)) { throw "Template not found: $TemplatePath" }
+try {
+    $template = Get-Content $TemplatePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+} catch {
+    throw "Template '$TemplatePath' is not valid JSON: $($_.Exception.Message)"
+}
+if (-not (Test-HasKey $template 'resources') -or $null -eq $template.resources) {
+    throw "Template '$TemplatePath' is missing a 'resources' array."
+}
+
+# Normalize graphScopes into a delegated set and an application (app-role) set. Accepts either
+# the legacy flat array (treated as delegated only) or an object { delegated:[], application:[] }.
+# Delegated mode requests the delegated set; an app-only access token is validated against the
+# application set. This keeps app-only-only permissions (e.g. Directory.ReadWrite.All, which
+# substitutes the delegated GroupSettings.ReadWrite.All) out of the delegated consent request.
+$delegatedScopes  = @()
+$applicationRoles = @()
+if ((Test-HasKey $template 'graphScopes') -and $null -ne $template.graphScopes) {
+    $graphScopes = $template.graphScopes
+    if ($graphScopes -is [System.Array] -or $graphScopes -is [string]) {
+        $delegatedScopes = @($graphScopes)
+    }
+    else {
+        if (Test-HasKey $graphScopes 'delegated')   { $delegatedScopes  = @($graphScopes.delegated) }
+        if (Test-HasKey $graphScopes 'application') { $applicationRoles = @($graphScopes.application) }
+    }
+}
+
+$templateName    = if (Test-HasKey $template 'template') { $template.template } else { [IO.Path]::GetFileNameWithoutExtension($TemplatePath) }
+$templateVersion = if (Test-HasKey $template 'version') { $template.version } else { 'n/a' }
+$templateDate    = if (Test-HasKey $template 'updated') { $template.updated } else { 'n/a' }
+Write-Host "Template    : $templateName v$templateVersion (updated $templateDate)"
+Write-Host "File        : $TemplatePath"
+Write-Host "Environment : $Environment ($GraphEndpoint)"
+Write-Host "WhatIf      : $([bool]$WhatIfPreference)"
+if (Test-HasKey $template 'description') { Write-Host "Description : $($template.description)" -ForegroundColor DarkGray }
+Write-Host ""
+
+# Build partner list from inputs
+$partners = Build-Partners
+Write-Host ""
+Write-Action Info ("Partners: {0}" -f (($partners | ForEach-Object { "$($_.displayName)=$($_.tenantId)" }) -join '; '))
+
+# Connect
+if (-not (Get-Module Microsoft.Graph.Authentication -ListAvailable)) {
+    throw "Microsoft.Graph.Authentication module not found. Install-Module Microsoft.Graph -Scope CurrentUser"
+}
+Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
+
 # In WhatIf, request read-only scopes only (no write consent needed to diff state)
 $scopesToRequest = @($delegatedScopes)
 if ($WhatIfPreference) {
@@ -664,11 +729,11 @@ if ($AccessToken) {
     $claims = Get-JwtClaims -Jwt $plainToken
     $granted = @()
     if ($claims) {
-        if ($claims.PSObject.Properties.Name -contains 'roles' -and $claims.roles) { $granted += @($claims.roles) }
-        if ($claims.PSObject.Properties.Name -contains 'scp'   -and $claims.scp)   { $granted += @([string]$claims.scp -split '\s+') }
+        if ((Test-HasKey $claims 'roles') -and $claims.roles) { $granted += @($claims.roles) }
+        if ((Test-HasKey $claims 'scp')   -and $claims.scp)   { $granted += @([string]$claims.scp -split '\s+') }
     }
     $granted = @($granted | Where-Object { $_ } | Select-Object -Unique)
-    $isAppOnly = [bool]($claims -and ($claims.PSObject.Properties.Name -contains 'roles') -and $claims.roles)
+    $isAppOnly = [bool]($claims -and (Test-HasKey $claims 'roles') -and $claims.roles)
     $plainToken = $null
 
     Write-Action Info "Authenticating with the supplied access token ($($EnvCfg.MgEnvironment))."
@@ -733,7 +798,7 @@ foreach ($res in $template.resources) {
     $label = [string](Resolve-Tokens -InputObject $res.name -Context (@{ 'graph-endpoint'=$GraphEndpoint } + (@{ partner = ($partners | Select-Object -First 1) })) -Tolerant)
     Write-Progress -Activity "Applying template ($idx/$total)" -Status $label -PercentComplete $pct
 
-    $isForEach = $res.PSObject.Properties.Name -contains 'forEach'
+    $isForEach = Test-HasKey $res 'forEach'
     try {
         if ($isForEach) {
             $srcName = $res.forEach.source   # "partners"

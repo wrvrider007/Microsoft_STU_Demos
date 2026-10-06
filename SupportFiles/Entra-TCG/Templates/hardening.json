@@ -1,26 +1,24 @@
 {
   "template": "hardening",
-  "version": "1.0.0",
-  "updated": "2026-09-14",
-  "description": "Entra ID security hardening baseline: break-glass and external-users groups, default user-permission restrictions, PIM authentication context, and Conditional Access policies (report-only).",
+  "version": "1.2.0",
+  "updated": "2026-10-06",
+  "description": "Required Entra hardening: emergency exclusion group, default creator restrictions, legacy owner-consent setting, PIM Admin context, and TCG01-TCG10 (created report-only). REQUIRED FOLLOW-ON: targeted user-consent update, Limited-or-stricter guest access, effective consent verification, eligible-admin PR-MFA coverage and native PIM settings, including attaching the PIM Admin context after its policies are enabled and validated. Existing policies are not upgraded or renamed.",
   "graphScopes": {
     "delegated": [
       "Group.ReadWrite.All",
       "Policy.ReadWrite.Authorization",
       "Policy.ReadWrite.ConditionalAccess",
       "Policy.Read.All",
-      "AuthenticationContext.ReadWrite.All",
-      "Application.Read.All",
-      "GroupSettings.ReadWrite.All"
+      "GroupSettings.ReadWrite.All",
+      "AuthenticationContext.ReadWrite.All"
     ],
     "application": [
       "Group.ReadWrite.All",
       "Policy.ReadWrite.Authorization",
       "Policy.ReadWrite.ConditionalAccess",
       "Policy.Read.All",
-      "AuthenticationContext.ReadWrite.All",
-      "Application.Read.All",
-      "Directory.ReadWrite.All"
+      "Directory.ReadWrite.All",
+      "AuthenticationContext.ReadWrite.All"
     ]
   },
   "resources": [
@@ -48,31 +46,6 @@
       }
     },
     {
-      "name": "Group - External Users All (dynamic)",
-      "type": "group",
-      "captureAs": "externalUsersAll",
-      "mode": "create",
-      "exists": {
-        "method": "GET",
-        "uri": "{{graph-endpoint}}/v1.0/groups?$filter=displayName eq 'External Users All'",
-        "match": "value[0]"
-      },
-      "create": {
-        "method": "POST",
-        "uri": "{{graph-endpoint}}/v1.0/groups",
-        "body": {
-          "displayName": "External Users All",
-          "description": "TCG - All external users",
-          "mailEnabled": false,
-          "mailNickname": "ExternalUsersAll",
-          "securityEnabled": true,
-          "groupTypes": ["DynamicMembership"],
-          "membershipRule": "(user.userPrincipalName -contains \"#EXT#\")",
-          "membershipRuleProcessingState": "On"
-        }
-      }
-    },
-    {
       "name": "Authorization policy - default user permissions hardening",
       "type": "authorizationPolicy",
       "mode": "configure",
@@ -80,18 +53,51 @@
         "method": "PATCH",
         "uri": "{{graph-endpoint}}/v1.0/policies/authorizationPolicy",
         "body": {
-          "guestUserRoleId": "10dae51f-b6af-4016-8d66-8c2a99b929b3",
           "defaultUserRolePermissions": {
             "allowedToCreateApps": false,
             "allowedToCreateSecurityGroups": false,
-            "allowedToCreateTenants": false,
-            "permissionGrantPoliciesAssigned": []
+            "allowedToCreateTenants": false
           }
         }
       }
     },
     {
-      "name": "Group settings - disable group and Team owner app consent",
+      "name": "Authentication context - PIM Admin Context (create if missing)",
+      "type": "authenticationContextClassReference",
+      "mode": "create",
+      "exists": {
+        "method": "GET",
+        "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/authenticationContextClassReferences",
+        "match": "value[?displayName=='PIM Admin Context']|[0]"
+      },
+      "create": {
+        "method": "PATCH",
+        "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/authenticationContextClassReferences/c90",
+        "body": {
+          "displayName": "PIM Admin Context",
+          "description": "TCG privileged role activation gates",
+          "isAvailable": true
+        },
+        "guard": {
+          "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/authenticationContextClassReferences",
+          "match": "value[?id=='c90']|[0]",
+          "message": "c90 is already assigned to another context. No overwrite performed. Choose an unused ID in the core template or prepare a verified dedicated PIM Admin Context, then preview again. Do not attach PIM roles until TCG09 and TCG10 are enforced and verified."
+        }
+      }
+    },
+    {
+      "name": "Authentication context - read dedicated PIM context",
+      "type": "authenticationContextClassReference",
+      "mode": "configure",
+      "captureAs": "pimContext",
+      "exists": {
+        "method": "GET",
+        "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/authenticationContextClassReferences",
+        "match": "value[?displayName=='PIM Admin Context']|[0]"
+      }
+    },
+    {
+      "name": "Group settings - legacy group owner consent (verify effective coverage)",
       "type": "groupSetting",
       "mode": "create",
       "exists": {
@@ -107,21 +113,6 @@
           "values": [
             { "name": "EnableGroupSpecificConsent", "value": "false" }
           ]
-        }
-      }
-    },
-    {
-      "name": "Authentication context - PIM Admin Context",
-      "type": "authenticationContextClassReference",
-      "mode": "configure",
-      "configure": {
-        "method": "PATCH",
-        "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/authenticationContextClassReferences/c90",
-        "body": {
-          "id": "c90",
-          "displayName": "PIM Admin Context",
-          "description": "Authentication context used for PIM privileged role activation",
-          "isAvailable": true
         }
       }
     },
@@ -157,51 +148,27 @@
       }
     },
     {
-      "name": "TCG02: Require Hybrid Entra Join",
+      "name": "TCG02: Protect risky sign-ins",
       "type": "conditionalAccessPolicy",
       "mode": "create",
       "dependsOn": ["Group - Emergency Access (break glass)"],
-      "exists": {
-        "method": "GET",
-        "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/policies",
-        "match": "value[?displayName=='TCG02: Require Hybrid Entra Join']|[0]"
-      },
-      "create": {
-        "method": "POST",
-        "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/policies",
-        "body": {
-          "displayName": "TCG02: Require Hybrid Entra Join",
-          "state": "enabledForReportingButNotEnforced",
-          "conditions": {
-            "clientAppTypes": ["all"],
-            "applications": { "includeApplications": ["All"] },
-            "users": {
-              "includeUsers": ["All"],
-              "excludeGroups": ["{{emergencyAccess.id}}"]
-            }
-          },
-          "grantControls": {
-            "operator": "OR",
-            "builtInControls": ["domainJoinedDevice"]
-          }
+      "exists": [
+        {
+          "method": "GET",
+          "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/policies",
+          "match": "value[?displayName=='TCG02: Protect risky sign-ins']|[0]"
+        },
+        {
+          "method": "GET",
+          "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/policies",
+          "match": "value[?displayName=='TCG03: Protect risky sign-ins']|[0]"
         }
-      }
-    },
-    {
-      "name": "TCG03: Protect risky sign-ins",
-      "type": "conditionalAccessPolicy",
-      "mode": "create",
-      "dependsOn": ["Group - Emergency Access (break glass)"],
-      "exists": {
-        "method": "GET",
-        "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/policies",
-        "match": "value[?displayName=='TCG03: Protect risky sign-ins']|[0]"
-      },
+      ],
       "create": {
         "method": "POST",
         "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/policies",
         "body": {
-          "displayName": "TCG03: Protect risky sign-ins",
+          "displayName": "TCG02: Protect risky sign-ins",
           "state": "enabledForReportingButNotEnforced",
           "conditions": {
             "clientAppTypes": ["all"],
@@ -227,20 +194,27 @@
       }
     },
     {
-      "name": "TCG04: Protect risky users",
+      "name": "TCG03: Protect risky users",
       "type": "conditionalAccessPolicy",
       "mode": "create",
       "dependsOn": ["Group - Emergency Access (break glass)"],
-      "exists": {
-        "method": "GET",
-        "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/policies",
-        "match": "value[?displayName=='TCG04: Protect risky users']|[0]"
-      },
+      "exists": [
+        {
+          "method": "GET",
+          "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/policies",
+          "match": "value[?displayName=='TCG03: Protect risky users']|[0]"
+        },
+        {
+          "method": "GET",
+          "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/policies",
+          "match": "value[?displayName=='TCG04: Protect risky users']|[0]"
+        }
+      ],
       "create": {
         "method": "POST",
         "uri": "{{graph-endpoint}}/beta/identity/conditionalAccess/policies",
         "body": {
-          "displayName": "TCG04: Protect risky users",
+          "displayName": "TCG03: Protect risky users",
           "state": "enabledForReportingButNotEnforced",
           "conditions": {
             "clientAppTypes": ["all"],
@@ -267,20 +241,27 @@
       }
     },
     {
-      "name": "TCG05: Block legacy authentication",
+      "name": "TCG04: Block legacy authentication",
       "type": "conditionalAccessPolicy",
       "mode": "create",
       "dependsOn": ["Group - Emergency Access (break glass)"],
-      "exists": {
-        "method": "GET",
-        "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/policies",
-        "match": "value[?displayName=='TCG05: Block legacy authentication']|[0]"
-      },
+      "exists": [
+        {
+          "method": "GET",
+          "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/policies",
+          "match": "value[?displayName=='TCG04: Block legacy authentication']|[0]"
+        },
+        {
+          "method": "GET",
+          "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/policies",
+          "match": "value[?displayName=='TCG05: Block legacy authentication']|[0]"
+        }
+      ],
       "create": {
         "method": "POST",
         "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/policies",
         "body": {
-          "displayName": "TCG05: Block legacy authentication",
+          "displayName": "TCG04: Block legacy authentication",
           "state": "enabledForReportingButNotEnforced",
           "conditions": {
             "clientAppTypes": ["exchangeActiveSync", "other"],
@@ -298,20 +279,27 @@
       }
     },
     {
-      "name": "TCG06: Block device code flow",
+      "name": "TCG05: Block device code flow",
       "type": "conditionalAccessPolicy",
       "mode": "create",
       "dependsOn": ["Group - Emergency Access (break glass)"],
-      "exists": {
-        "method": "GET",
-        "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/policies",
-        "match": "value[?displayName=='TCG06: Block device code flow']|[0]"
-      },
+      "exists": [
+        {
+          "method": "GET",
+          "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/policies",
+          "match": "value[?displayName=='TCG05: Block device code flow']|[0]"
+        },
+        {
+          "method": "GET",
+          "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/policies",
+          "match": "value[?displayName=='TCG06: Block device code flow']|[0]"
+        }
+      ],
       "create": {
         "method": "POST",
         "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/policies",
         "body": {
-          "displayName": "TCG06: Block device code flow",
+          "displayName": "TCG05: Block device code flow",
           "state": "enabledForReportingButNotEnforced",
           "conditions": {
             "clientAppTypes": ["all"],
@@ -330,20 +318,27 @@
       }
     },
     {
-      "name": "TCG07: Protect security info registration",
+      "name": "TCG06: Protect security info registration",
       "type": "conditionalAccessPolicy",
       "mode": "create",
       "dependsOn": ["Group - Emergency Access (break glass)"],
-      "exists": {
-        "method": "GET",
-        "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/policies",
-        "match": "value[?displayName=='TCG07: Protect security info registration']|[0]"
-      },
+      "exists": [
+        {
+          "method": "GET",
+          "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/policies",
+          "match": "value[?displayName=='TCG06: Protect security info registration']|[0]"
+        },
+        {
+          "method": "GET",
+          "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/policies",
+          "match": "value[?displayName=='TCG07: Protect security info registration']|[0]"
+        }
+      ],
       "create": {
         "method": "POST",
         "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/policies",
         "body": {
-          "displayName": "TCG07: Protect security info registration",
+          "displayName": "TCG06: Protect security info registration",
           "state": "enabledForReportingButNotEnforced",
           "conditions": {
             "clientAppTypes": ["all"],
@@ -361,20 +356,27 @@
       }
     },
     {
-      "name": "TCG08: Protect device registration",
+      "name": "TCG07: Protect device registration",
       "type": "conditionalAccessPolicy",
       "mode": "create",
       "dependsOn": ["Group - Emergency Access (break glass)"],
-      "exists": {
-        "method": "GET",
-        "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/policies",
-        "match": "value[?displayName=='TCG08: Protect device registration']|[0]"
-      },
+      "exists": [
+        {
+          "method": "GET",
+          "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/policies",
+          "match": "value[?displayName=='TCG07: Protect device registration']|[0]"
+        },
+        {
+          "method": "GET",
+          "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/policies",
+          "match": "value[?displayName=='TCG08: Protect device registration']|[0]"
+        }
+      ],
       "create": {
         "method": "POST",
         "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/policies",
         "body": {
-          "displayName": "TCG08: Protect device registration",
+          "displayName": "TCG07: Protect device registration",
           "state": "enabledForReportingButNotEnforced",
           "conditions": {
             "clientAppTypes": ["all"],
@@ -392,20 +394,27 @@
       }
     },
     {
-      "name": "TCG09: Protect Admin Roles",
+      "name": "TCG08: Protect Admin Roles",
       "type": "conditionalAccessPolicy",
       "mode": "create",
       "dependsOn": ["Group - Emergency Access (break glass)"],
-      "exists": {
-        "method": "GET",
-        "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/policies",
-        "match": "value[?displayName=='TCG09: Protect Admin Roles']|[0]"
-      },
+      "exists": [
+        {
+          "method": "GET",
+          "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/policies",
+          "match": "value[?displayName=='TCG08: Protect Admin Roles']|[0]"
+        },
+        {
+          "method": "GET",
+          "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/policies",
+          "match": "value[?displayName=='TCG09: Protect Admin Roles']|[0]"
+        }
+      ],
       "create": {
         "method": "POST",
         "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/policies",
         "body": {
-          "displayName": "TCG09: Protect Admin Roles",
+          "displayName": "TCG08: Protect Admin Roles",
           "state": "enabledForReportingButNotEnforced",
           "conditions": {
             "clientAppTypes": ["all"],
@@ -425,37 +434,60 @@
                 "9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3",
                 "158c047a-c907-4556-b7ef-446551a6b5f7",
                 "c4e39bd9-1100-46d3-8c65-fb160da0071f",
-                "7be44c8a-adaf-4e2a-84d6-ab2649e08a13"
+                "7be44c8a-adaf-4e2a-84d6-ab2649e08a13",
+                "0526716b-113d-4c15-b2c8-68e3c22b9f80",
+                "fdd7a751-b60b-444a-984c-02652fe8fa1c",
+                "8ac3fc64-6eca-42ea-9e69-59f4c7b60eb2",
+                "8329153b-31d0-4727-b945-745eb3bc5f31",
+                "be2f45a1-457d-42af-a067-6ec1fa63bc45",
+                "25a516ed-2fa0-40ea-a2d0-12923a21473a",
+                "45d8d3c5-c802-45c6-b32a-1d70b5e1e86e",
+                "59d46f88-662b-457b-bceb-5c3809e5908f",
+                "7698a772-787b-4ac8-901f-60d6b08affd2",
+                "9360feb5-f418-4baa-8175-e2a00bac4301",
+                "ecb2c6bf-0ab6-418e-bd87-7986f8d63bbe",
+                "58f930cc-fcf4-4152-852c-1d7dbf502139",
+                "5f2222b1-57c3-48ba-8ad5-d4759f1fde6f",
+                "db506228-d27e-4b7d-95e5-295956d6615f",
+                "1981f584-96e9-4a6f-95b0-f522373f8fae"
               ],
               "excludeGroups": ["{{emergencyAccess.id}}"]
             }
           },
           "grantControls": {
             "operator": "AND",
-            "authenticationStrength": { "id": "00000000-0000-0000-0000-000000000002" }
+            "authenticationStrength": { "id": "00000000-0000-0000-0000-000000000004" }
           }
         }
       }
     },
     {
-      "name": "TCG10: PIM Admin - Block high user risk (PIM Admin Context)",
+      "name": "TCG09: PIM Admin - Block high user risk",
       "type": "conditionalAccessPolicy",
       "mode": "create",
-      "dependsOn": ["Group - Emergency Access (break glass)", "Authentication context - PIM Admin Context"],
-      "exists": {
-        "method": "GET",
-        "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/policies",
-        "match": "value[?displayName=='TCG10: PIM Admin - Block high user risk']|[0]"
-      },
+      "requires": ["pimContext", "emergencyAccess"],
+      "dependsOn": ["Authentication context - read dedicated PIM context", "Group - Emergency Access (break glass)"],
+      "exists": [
+        {
+          "method": "GET",
+          "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/policies",
+          "match": "value[?displayName=='TCG09: PIM Admin - Block high user risk']|[0]"
+        },
+        {
+          "method": "GET",
+          "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/policies",
+          "match": "value[?displayName=='TCG10: PIM Admin - Block high user risk']|[0]"
+        }
+      ],
       "create": {
         "method": "POST",
         "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/policies",
         "body": {
-          "displayName": "TCG10: PIM Admin - Block high user risk",
+          "displayName": "TCG09: PIM Admin - Block high user risk",
           "state": "enabledForReportingButNotEnforced",
           "conditions": {
             "clientAppTypes": ["all"],
-            "applications": { "includeAuthenticationContextClassReferences": ["c90"] },
+            "applications": { "includeAuthenticationContextClassReferences": ["{{pimContext.id}}"] },
             "users": {
               "includeUsers": ["All"],
               "excludeGroups": ["{{emergencyAccess.id}}"]
@@ -470,24 +502,32 @@
       }
     },
     {
-      "name": "TCG11: PIM Admin - Require Auth Strength",
+      "name": "TCG10: PIM Admin - Require Auth Strength",
       "type": "conditionalAccessPolicy",
       "mode": "create",
-      "dependsOn": ["Group - Emergency Access (break glass)", "Authentication context - PIM Admin Context"],
-      "exists": {
-        "method": "GET",
-        "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/policies",
-        "match": "value[?displayName=='TCG11: PIM Admin - Require Auth Strength']|[0]"
-      },
+      "requires": ["pimContext", "emergencyAccess"],
+      "dependsOn": ["Authentication context - read dedicated PIM context", "Group - Emergency Access (break glass)"],
+      "exists": [
+        {
+          "method": "GET",
+          "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/policies",
+          "match": "value[?displayName=='TCG10: PIM Admin - Require Auth Strength']|[0]"
+        },
+        {
+          "method": "GET",
+          "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/policies",
+          "match": "value[?displayName=='TCG11: PIM Admin - Require Auth Strength']|[0]"
+        }
+      ],
       "create": {
         "method": "POST",
         "uri": "{{graph-endpoint}}/v1.0/identity/conditionalAccess/policies",
         "body": {
-          "displayName": "TCG11: PIM Admin - Require Auth Strength",
+          "displayName": "TCG10: PIM Admin - Require Auth Strength",
           "state": "enabledForReportingButNotEnforced",
           "conditions": {
             "clientAppTypes": ["all"],
-            "applications": { "includeAuthenticationContextClassReferences": ["c90"] },
+            "applications": { "includeAuthenticationContextClassReferences": ["{{pimContext.id}}"] },
             "users": {
               "includeUsers": ["All"],
               "excludeGroups": ["{{emergencyAccess.id}}"]
@@ -495,7 +535,7 @@
           },
           "grantControls": {
             "operator": "AND",
-            "authenticationStrength": { "id": "00000000-0000-0000-0000-000000000002" }
+            "authenticationStrength": { "id": "00000000-0000-0000-0000-000000000004" }
           },
           "sessionControls": {
             "signInFrequency": {

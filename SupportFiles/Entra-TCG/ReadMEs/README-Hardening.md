@@ -1,200 +1,340 @@
-# hardening.json — Entra ID Security Hardening Baseline
+# Entra ID Hardening - Required Baseline and Future Enhancements
 
-## Overview
+## Scope and application model
 
-`hardening.json` is a declarative template applied by `Apply-GraphTemplate.ps1`
-(documented in **README-Engine.md**). It provisions a per-tenant Microsoft Entra ID
-security-hardening baseline that reduces identity-based attack surface: a break-glass group,
-restricted default user permissions, user and group/Team owner consent lockdown, a PIM
-authentication context, and a set of Conditional Access policies. Unlike `collaboration.json`,
-it is single-tenant and takes no partner input.
+This TCG hardens **Microsoft Entra**, not all of Microsoft 365. Teams-specific
+resource-specific consent (RSC) belongs in a separate Teams TCG. Collaboration
+guidance may span Entra, Teams and SharePoint when needed for its outcome.
+Authentication-method deployment, endpoint/MDM configuration, Azure resource-role
+PIM and general guest lifecycle reviews are not hardening deployment workstreams.
 
-The template is idempotent: it may be applied repeatedly, and each run reconciles the
-tenant to the declared desired state. All Conditional Access policies are created in
-**report-only** so their impact can be reviewed before enforcement.
+`Templates\hardening.json` v1.2.0 has **15 resources**: the Emergency Access
+exclusion group, default creator restrictions, a legacy owner-consent settings
+object, the PIM Admin authentication context, and ten required CA policies. New CA policies are **report-only**;
+authorization settings take effect immediately. Existing create-mode objects are
+found and **left unchanged**, not reconciled, renamed or upgraded.
 
-## Invocation
+**Applying the template alone does not complete the baseline.** Required
+state-aware consent/guest checks, administrator coverage, native PIM settings,
+effective-configuration review and explicit CA enforcement remain follow-on
+steps. Do not interpret `Found`, `Skipped`, or a successful run as compliance.
+The generic engine is unchanged.
+
+Run from `Entra-TCG\Scripts` (or adapt paths for flat uploads):
 
 ```powershell
-# Read-only preview (requests read-only scopes only):
-.\Apply-GraphTemplate.ps1 -TemplatePath .\hardening.json -WhatIf
-
-# Apply the baseline:
-.\Apply-GraphTemplate.ps1 -TemplatePath .\hardening.json
+.\Apply-GraphTemplate.ps1 -TemplatePath ..\Templates\hardening.json -WhatIf
+# Only after reviewing the target and immediate changes:
+.\Apply-GraphTemplate.ps1 -TemplatePath ..\Templates\hardening.json -StopOnError
 ```
 
-No `-Domain` or `-TenantId` is required — the template applies to the signed-in tenant.
-The `-Environment` parameter (Global / USGov / USGovDoD / Custom) selects the cloud, and
-`{{graph-endpoint}}` is injected accordingly.
+`-Environment Global`, `USGov`, or `USGovDoD` selects a built-in cloud; other names
+require a validated `clouds.json`. Omit partner `-Domain`/`-TenantId` inputs:
+hardening acts on the signed-in tenant. See [README-Engine.md](README-Engine.md)
+and [CloudShellDeployment.md](CloudShellDeployment.md) for authentication routes.
 
-## Design principles
+## Required outcomes
 
-The template implements the following model:
+| Area | Required baseline | How applied |
+|---|---|---|
+| Emergency recovery | At least two cloud-only, non-federated `.onmicrosoft.com` accounts; permanent-active Global Administrator; independently registered phishing-resistant credentials; strong random passwords where retained; secure resilient custody | Manual readiness; reuse qualifying accounts |
+| Recovery exceptions | Effective exclusions from all enabled CA policies that could restrict recovery, including existing non-TCG policies | Template uses Emergency Access; direct exclusions are a valid manual alternative |
+| Emergency operations | Emergency-only use and post-use review, monitoring/alerts, initial and recurring recovery tests, designated trusted secure administrative client | Existing processes; monitoring configuration belongs to the Sentinel TCG |
+| Administrative identities | Dedicated cloud-only human privileged-admin identities; remove privileged Entra roles from synchronized identities after validating replacement access | Manual assignment review/migration, not user-account deletion |
+| Creator permissions | Ordinary users cannot register apps, create security groups or create tenants; explicitly authorized delegation remains possible | Authorization-policy PATCH |
+| User consent | Ordinary users cannot independently grant new OAuth permissions; existing grants are not revoked | Targeted follow-on below, not a blanket collection reset |
+| Owner consent | Applicable Entra Group/owner consent restrictions and verification of effective coverage | Legacy setting create-if-missing; verify supported control; Teams RSC implementation is owned by Teams TCG |
+| Guest directory access | Limited **or stricter** for Guest identities; never downgrade an existing stricter setting | State-aware follow-on below; external Members are not covered by guest tier |
+| User authentication | General MFA, risky-sign-in fresh MFA, high-user-risk remediation, legacy/device-code restrictions, registration MFA | TCG01-TCG07 after readiness/impact review |
+| Privileged authentication | Phishing-resistant MFA for applicable human administrators, including eligible identities and PIM activation | TCG08, TCG10, and actual administrator coverage review |
+| Entra role PIM | Applicable human assignments eligible rather than standing; native activation MFA; bounded role-appropriate activation; PIM Admin context attached after TCG09/TCG10 are enforced and validated; initial assignment inventory and periodic entitlement review | Core template plus manual Entra role settings; emergency accounts remain permanent active |
 
-- **Report-only first.** All Conditional Access policies (TCG01–TCG11) are created in
-  `enabledForReportingButNotEnforced` and exclude the Emergency Access break-glass group.
-  Review impact in the sign-in logs, then enable each policy individually.
-- **Built-in MFA strength now; phishing-resistant MFA is the end goal.** Every MFA
-  requirement uses the built-in *Multifactor authentication* authentication strength
-  (`00000000-0000-0000-0000-000000000002`), not the legacy `mfa` grant control. A future
-  iteration moves the registration, admin, and PIM policies to phishing-resistant strength
-  (`…004`) for all users and applications.
-- **Create-if-missing safety.** The group and Team owner consent lockdown is created only
-  when a `Group.Unified` group-settings object does not already exist, so other
-  group-governance settings on an existing object are never overwritten.
-- **The script manages only what it declares.** Existing objects are detected and left in
-  place; group lookups dedupe on `displayName` so re-runs never duplicate policies or groups.
+Secure custody must remain available during an identity outage; the affected
+tenant must not be the sole credential-retrieval dependency. A physical vault is
+recommended, not mandated where an equivalent arrangement meets the outcome.
+Review every emergency use; investigate unexplained activity rather than treating
+every planned drill as a full incident. Quarterly/90-day tests and routine
+post-use password rotation are recommendations; suspected exposure still requires
+appropriate incident-response rotation/revocation. Password rotation does not
+revoke passkeys, certificates or sessions.
 
-## Required Microsoft Graph permissions
+## Required Conditional Access policies
 
-These are the **delegated** scopes (`graphScopes.delegated`), used for interactive sign-in:
+New policies exclude the captured Emergency Access group. It is created empty
+if missing: validate and populate it before enforcement. The assigned group is
+a convenient implementation, **not a required new group**; manual deployments
+may use documented direct account exclusions. Protect group membership.
 
-```
-Group.ReadWrite.All                 AuthenticationContext.ReadWrite.All
-Policy.ReadWrite.Authorization      Application.Read.All
-Policy.ReadWrite.ConditionalAccess  GroupSettings.ReadWrite.All
-Policy.Read.All
-```
+MFA strength is `00000000-0000-0000-0000-000000000002`; phishing-resistant
+strength is `00000000-0000-0000-0000-000000000004`.
 
-For app-only execution via `-AccessToken` (service principal or managed identity), the template's
-`graphScopes.application` set is used instead. It is identical **except** that
-`GroupSettings.ReadWrite.All` has no application-permission equivalent, so the app role
-**`Directory.ReadWrite.All`** is required to create the `Group.Unified` settings object app-only.
-`Scripts/Initialize-TcgDeployerApp.ps1` grants that application set automatically.
-
-Microsoft Entra ID **P2** is required for the risk-based policies (TCG03, TCG04) and for
-Privileged Identity Management. Delegated execution requires the Conditional Access
-Administrator, Authentication Policy Administrator, and Groups Administrator roles, or
-Global Administrator. In `-WhatIf`, the engine requests read-only equivalents of the write
-scopes so no write consent is needed to diff state.
-
-## Applied configuration
-
-Resources are applied in template order. The tables below describe each resource and the
-action the script performs.
-
-### Groups
-
-Security groups are created if missing (dedupe on `displayName`) and captured for reference
-by later resources. The token `#EXT#` in a user principal name identifies an external user.
-
-| # | Group display name | Type | Purpose |
+| Policy | Users and resources | Trigger | Grant/session |
 |---|---|---|---|
-| 1 | Emergency Access | Assigned | Break-glass accounts. **Created empty — populate with 2+ cloud-only accounts.** Excluded from every Conditional Access policy. Captured as `emergencyAccess`. |
-| 2 | External Users All | Dynamic | UPN contains `#EXT#`. All external users. Captured as `externalUsersAll`. Shared, identically defined with `collaboration.json` so each template can run on its own. |
+| TCG01 - Require MFA for all users | All users, all resources | All client types | Built-in MFA strength |
+| TCG02 - Protect risky sign-ins | All users, all resources | High **and medium** sign-in risk levels (either triggers) | MFA strength; every-time primary/secondary authentication |
+| TCG03 - Protect risky users | All users, all resources | High user risk | Risk remediation **AND** MFA strength; mandatory every-time authentication |
+| TCG04 - Block legacy authentication | All users, all resources | Legacy `exchangeActiveSync` / `other` client categories | Block |
+| TCG05 - Block device code flow | All users, all resources | `deviceCodeFlow` | Block |
+| TCG06 - Protect security info registration | All users; register-security-info action | All client types | MFA strength; no extra device/location/session condition |
+| TCG07 - Protect device registration | All users; register-or-join-devices action | All client types | MFA strength; **no every-time session control** |
+| TCG08 - Protect Admin Roles | Selected built-in directory roles, all resources | All client types | **Phishing-resistant** MFA strength |
+| TCG09 - PIM Admin - Block high user risk | All users requesting the PIM Admin context | High user risk | Block |
+| TCG10 - PIM Admin - Require Auth Strength | All users requesting the PIM Admin context | All client types | Phishing-resistant MFA strength; every-time primary/secondary authentication |
 
-### Tenant policy and consent
+TCG02 is not redundant with general MFA: it adds fresh authentication on risk.
+TCG03 addresses identity compromise, not only a suspicious sign-in; do not merge
+the risk policies so that both conditions must be present. TCG03 retains the
+newer `riskRemediation` grant (Graph **beta** creation), including passwordless
+remediation; do not substitute an unconditional password-change grant.
 
-| # | Resource | Action |
+TCG04 is not a protocol-wide ban on every EAS/SMTP use. TCG05 covers modern
+device-code authentication, which can satisfy MFA; legacy blocking does not
+replace it. Authentication transfer is a separate feature and is not blocked here.
+Inventory legitimate dependencies; additional exceptions must be individually
+approved, documented and secured, not a blanket exemption for administrators
+or all service accounts. User-based service accounts can be affected; service
+principals are not targeted by these user CA policies.
+
+Before registration enforcement, validate a supported bootstrap path and
+external-user registration. Existing method compatibility matters: ordinary MFA
+claims/external methods do not necessarily satisfy the configured strength.
+Do not require every user to already possess a phishing-resistant credential just
+to enroll their first one. Method enablement, TAP issuance, PKI and pilot scope
+procedures belong in authentication-method guidance, not this deployment.
+
+**TCG07 prerequisite:** coordinate Entra's older **Require MFA to register or
+join devices** tenant setting to **No** with enforced CA registration protection.
+Microsoft warns that the CA user action is not properly enforced with the older
+switch enabled. Do not turn off existing protection while the replacement is
+merely report-only; stage, approve and validate the transition.
+
+### Administrator roles and coverage
+
+TCG08 retains Microsoft's recommended 14-role minimum and adds security-relevant
+built-in Entra roles. These are **human role holders**, not a recommendation to
+assign any role or deploy every underlying feature.
+
+| Set | Roles |
+|---|---|
+| Original tenant/security | Global Administrator; Privileged Role Administrator; Security Administrator; Conditional Access Administrator |
+| Original users/credentials | User Administrator; Helpdesk Administrator; Password Administrator; Authentication Administrator; Privileged Authentication Administrator |
+| Original apps/services | Application Administrator; Cloud Application Administrator; Exchange Administrator; SharePoint Administrator; Billing Administrator |
+| Added authentication/trust | Authentication Policy Administrator; Hybrid Identity Administrator; Domain Name Administrator; External Identity Provider Administrator; Authentication Extensibility Administrator |
+| Added access/lifecycle | Groups Administrator; Identity Governance Administrator; Lifecycle Workflows Administrator; Attribute Provisioning Administrator; Directory Writers |
+| Added devices/response | Cloud Device Administrator; Entra SOC Identity Responder; Security Operator |
+| Added newer capabilities | Agent ID Administrator; Tenant Governance Administrator |
+
+Preflight role availability and CA support in the target cloud, particularly for
+newer roles. An unavailable role is a deployment issue to resolve explicitly,
+not a reason to silently omit protection for an actual administrator. The role
+IDs are in the template; this list is **not every role carrying the preview
+Privileged label**.
+
+Review the actual administrator roster. Built-in role targeting does not cover
+custom/AU-scoped assignments or prove protection of eligible administrators
+before activation. Extend supported targeting or use explicit administrator
+account/group targeting where needed, with the approved emergency exclusions.
+No universal new admin group is mandated. TCG08's template role list alone is
+not evidence that this coverage requirement is met.
+
+## State-aware authorization follow-on (required)
+
+The static template PATCH contains only the three required creator restrictions.
+It deliberately does **not** clear `permissionGrantPoliciesAssigned`, or reset
+`guestUserRoleId` to Limited. Those unconditional writes would violate the
+approved preservation requirements.
+
+Using the **same verified tenant/cloud**, read `/v1.0/policies/authorizationPolicy`
+through Graph or the corresponding portal settings before any targeted update.
+Use `Policy.Read.All` for the read and `Policy.ReadWrite.Authorization` for a
+Graph update; delegated updates require Privileged Role Administrator.
+
+| Check | Required targeted action |
+|---|---|
+| User consent assignments | Remove ordinary-user self-consent assignments (`managePermissionGrantsForSelf.*`). Inspect other developer/owned-resource policies; retain them **only after explicit approval**, not simply because they already exist. PATCH only the reviewed `defaultUserRolePermissions.permissionGrantPoliciesAssigned` collection in the v1.0 authorization policy; do not replace unrelated properties. An empty collection is valid if no approved paths remain, but is not an unconditional baseline reset. |
+| Guest tier | If already Limited (`10dae51f-b6af-4016-8d66-8c2a99b929b3`) or Restricted (`2af84b1e-32c8-42b7-82bc-daa82404023b`), preserve it. Change member-equivalent guest defaults to at least Limited after approval. Stop and investigate unrecognized state; never downgrade Restricted. |
+| Owner consent | Inspect the existing Group.Unified values and applicable supported Entra owner-consent control. The template sets `EnableGroupSpecificConsent=false` **only when creating** a missing settings object. Preserve other values on any approved update. This legacy setting alone does not prove current Teams RSC coverage. Cross-reference the Teams TCG for team/chat/personal-scope controls. |
+
+Read again after applying the reviewed change and verify the effective outcome.
+Do not reset other authorization-policy properties or existing consent grants.
+Guest directory restrictions are not a Teams/SharePoint content-access boundary.
+
+## Native PIM configuration (required, manual)
+
+Review Entra role assignments using Discovery and Insights, role views, or an
+equivalent current read-only inventory. Convert applicable human administrative
+assignments to eligible; document other approved exceptions and handle workload
+principals separately. **PIM is role-assignment/settings work, not a single
+tenant-wide on/off switch.**
+
+For applicable Entra roles require native **MFA on activation** and a bounded,
+role-appropriate activation maximum (supported range 1-24 hours). Reuse suitable
+existing limits; no universal hour count is prescribed. Native MFA can accept
+earlier satisfied MFA: it is not a fresh or phishing-resistant guarantee.
+Independently protect eligible admin accounts with the approved PR-MFA coverage.
+Periodically review entitlement need and record retain/remove decisions; existing
+review processes are acceptable and automated access-review campaigns optional.
+
+Require justification for every applicable Entra role activation. Selective
+approval (especially GA/PRA), notification recipient tuning, ticket numbers,
+and PIM for explicitly privileged Entra groups are **recommended, not
+required**. If approval is adopted, configure available approvers (preferably
+two) and preserve recovery; no external PAM/ticket workflow is mandated.
+
+## PIM Admin context deployment and enforcement
+
+The core template creates or reuses a verified dedicated PIM Admin context and
+creates TCG09/TCG10 in report-only mode. The context is not a standalone control:
+after report-only review, enforce and validate both policies before attaching the
+context to applicable eligible Entra role activation settings.
+
+| Policy | Scope | Requirement |
 |---|---|---|
-| 3 | Authorization policy — default user permissions | *Configure.* Idempotent PATCH setting `allowedToCreateApps=false`, `allowedToCreateSecurityGroups=false`, `allowedToCreateTenants=false`, `permissionGrantPoliciesAssigned=[]` (user consent to apps disabled), and `guestUserRoleId` to the **limited** guest tier (`10dae51f-b6af-4016-8d66-8c2a99b929b3`) — guests get restricted directory access while remaining distinct from members. High-side tenants can tighten this to the most-restrictive role (`2af84b1e-32c8-42b7-82bc-daa82404023b`, guests see only their own objects). |
-| 4 | Group settings — disable group and Team owner consent | *Create-if-missing.* Creates the `Group.Unified` group-settings object with `EnableGroupSpecificConsent=false`, closing the group/Team owner consent path. If a `Group.Unified` object already exists it is **not** modified. |
+| TCG09 - PIM Admin - Block high user risk | All users requesting the dedicated context; emergency exclusions | Block high user risk at activation |
+| TCG10 - PIM Admin - Require Auth Strength | Same context/users | PR-MFA strength plus every-time authentication |
 
-### Authentication context
+Before applying, inspect context ownership, ID, display name and publication.
+The template reuses a **verified dedicated** `PIM Admin Context` by name, or
+creates `c90` if unused. It never overwrites a context. If an unrelated `c90`
+exists, creation is guarded and dependent policies are skipped unless a dedicated
+context can be found. Resolve warnings/skips; they are not successful protection.
+To choose another free ID, change the context creation URI. Policies bind to the
+captured context ID, not a separate hard-coded ID. Reject duplicate names and
+verify any reused context is published and dedicated to this purpose.
 
-| # | Resource | Action |
-|---|---|---|
-| 5 | Authentication context — PIM Admin Context | *Configure.* Creates/publishes authentication context `c90` ("PIM Admin Context") used by the PIM-tier policies. Assumed unused in the target tenant. |
+The context PATCH returns no body, so a separate read captures its ID before
+policy creation. Preview can skip dependent policies when the context has not yet
+been created; review them again once prerequisites exist. Ensure both policies
+are enforced, correctly targeted and tested **before** attaching the context to
+eligible Entra role activation settings. PIM's backup MFA does not activate merely
+because a context policy is report-only, disabled, or excludes the user.
+Every-time reauthentication has a documented 10-minute tolerance across
+activations. Context gates elevation, not every subsequent privileged session;
+TCG08 and eligible-account coverage remain independently required.
 
-> **Authentication methods are intentionally out of scope.** Enabling passwordless methods
-> (FIDO2/passkey, certificate-based auth, Temporary Access Pass) is **not** automated by this
-> template. Unlike Conditional Access, the authentication methods policy has **no report-only
-> mode** — it takes effect tenant-wide the instant it is written, and scoping a method to a pilot
-> group can immediately lock out anyone (including the operator) who relies on that method but is
-> not in the group. Configure authentication methods manually in the portal, adding your own
-> account and break-glass accounts to the pilot group **before** enabling and registering, then
-> expand the pilot deliberately.
+## Safe migration from v1.0.0
 
-### Conditional Access policies
+| Old policy | New policy / disposition |
+|---|---|
+| TCG01 - Require MFA for all users | TCG01 |
+| TCG02 - Require Hybrid Entra Join | Removed from baseline; review live retirement separately |
+| TCG03 - Protect risky sign-ins | TCG02 |
+| TCG04 - Protect risky users | TCG03 |
+| TCG05 - Block legacy authentication | TCG04 |
+| TCG06 - Block device code flow | TCG05 |
+| TCG07 - Protect security info registration | TCG06 |
+| TCG08 - Protect device registration | TCG07; no extra session-frequency requirement |
+| TCG09 - Protect Admin Roles | TCG08; upgrade MFA to PR-MFA and review expanded coverage |
+| TCG10 - PIM Admin - Block high user risk | TCG09 |
+| TCG11 - PIM Admin - Require Auth Strength | TCG10; requires PR-MFA |
 
-All policies are created (dedupe on `displayName`) in **report-only**
-(`enabledForReportingButNotEnforced`) and **exclude the Emergency Access group**. "Auth
-strength: MFA" is the built-in *Multifactor authentication* strength (`…002`).
+Templates look up the **complete new display name first**, then the complete
+legacy display name for the same control. Matching only `TCG02`, for example,
+would confuse the old hybrid policy with the new risk policy. These fallbacks
+prevent blindly duplicating a known legacy control; they do **not** rename or
+upgrade it. `Found` can leave an old ordinary-MFA admin policy in place.
 
-| # | Policy | Target | Condition | Grant control |
-|---|---|---|---|---|
-| 6 | TCG01 — Require MFA for all users | All users, all apps | — | Auth strength: MFA |
-| 7 | TCG02 — Require Hybrid Entra Join | All users, all apps | — | Require Hybrid Entra joined device |
-| 8 | TCG03 — Protect risky sign-ins | All users, all apps | Sign-in risk high/medium | Auth strength: MFA + sign-in frequency every time |
-| 9 | TCG04 — Protect risky users | All users, all apps | User risk high | (AND) Risk remediation + auth strength: MFA + sign-in frequency every time |
-| 10 | TCG05 — Block legacy authentication | All users, all apps | Client apps: Exchange ActiveSync, other | Block |
-| 11 | TCG06 — Block device code flow | All users, all apps | Auth flow: device code flow | Block |
-| 12 | TCG07 — Protect security info registration | All users | User action: register security info | Auth strength: MFA |
-| 13 | TCG08 — Protect device registration | All users | User action: register or join devices | Auth strength: MFA + sign-in frequency every time |
-| 14 | TCG09 — Protect Admin Roles | Admin directory roles | — | Auth strength: MFA |
-| 15 | TCG10 — PIM Admin — Block high user risk | Auth context `c90` | User risk high | Block |
-| 16 | TCG11 — PIM Admin — Require Auth Strength | Auth context `c90` | — | Auth strength: MFA + sign-in frequency every time |
+Inventory exact IDs and full names, detect duplicates (including old and new
+copies), export current settings, then approve targeted rename/configuration
+changes. Preserve unrelated conditions/exceptions and the current policy state.
+Review PR-MFA readiness before upgrading an enabled policy; do not silently
+reset it to report-only or strengthen it without that review. Retire the old hybrid policy or old PIM gates only through an approved live change.
+Removing a resource from JSON does not delete or disable its tenant object.
+Existing `External Users All` and collaboration configuration remain untouched.
 
-## Operational considerations
+## Permissions and capability preflight
 
-### Conditional Access policies ship in report-only
+| Route | Core template permissions |
+|---|---|
+| Delegated | `Group.ReadWrite.All`, `Policy.ReadWrite.Authorization`, `Policy.ReadWrite.ConditionalAccess`, `Policy.Read.All`, `GroupSettings.ReadWrite.All`, `AuthenticationContext.ReadWrite.All` |
+| Application | Same, except `Directory.ReadWrite.All` replaces delegated `GroupSettings.ReadWrite.All` |
 
-Every policy is created in `enabledForReportingButNotEnforced`. Report-only policies record
-impact but do not block or grant. After reviewing sign-in-log impact, enable TCG01–TCG11
-individually. Because report-only does not enforce, `block` policies (TCG05, TCG06, TCG10)
-show would-be impact but do not block until enabled.
+Delegated core deployment requires Conditional Access Administrator, Groups
+Administrator and Privileged Role Administrator, or a suitable authorized
+higher-privilege identity. PIM/method/portal follow-on tasks have their own role
+requirements; do not confuse the deployer's Graph scopes with those permissions.
+`Application.Read.All` and authentication-method write permission are not core
+template requirements.
+App-only directory write privilege remains broad: grant deliberately and use
+delegated/manual owner-setting configuration where appropriate.
 
-### Emergency Access is created empty
+Required risk policies need Entra P2; native PIM needs P2 or applicable Entra
+Governance entitlement. Confirm licensing for affected users and exact feature,
+API, role and authentication-strength availability in the target cloud, especially
+beta `riskRemediation`. Endpoint selection does not establish feature parity.
+If a required capability is unavailable, stop and resolve the gap/approved
+exception; do not silently omit the control.
 
-The break-glass group is created but has no members. Populate it with two or more
-cloud-only accounts (assigned Global Administrator, long random credentials stored offline)
-**before** enabling any policy — every policy excludes this group so break-glass accounts
-retain access during a lockout.
+`-WhatIf` performs no writes, but the unchanged engine only maps certain
+delegated write scopes to read equivalents. It can still request a write scope
+for group settings or the PIM context; a supplied token retains all its
+granted privileges. For strict read-permission preview, supply an appropriate
+read-only token. Never describe the token itself as read-only just because
+`-WhatIf` was used.
 
-### Authentication methods are configured manually
+## Simplified go-live
 
-The template does **not** enable or scope any authentication method (FIDO2/passkey,
-certificate-based auth, Temporary Access Pass) and does not create per-method pilot groups. The
-authentication methods policy has no report-only mode and takes effect tenant-wide immediately,
-so scoping a method to a pilot group can lock out anyone (including the operator) who relies on
-that method but is not yet in the group. Configure methods in the portal: add your own account
-and the break-glass accounts to the pilot group **before** enabling and registering, then expand
-deliberately. (Windows Hello for Business is likewise out of scope — it is device-registration /
-Intune-managed, not part of the authentication methods policy.)
+1. Confirm the tenant/cloud and validate both emergency accounts, custody, secure
+   client and effective exceptions. Reuse accounts/groups rather than duplicate.
+2. Choose **one** execution route; check retained-control licensing, capabilities,
+   runtime (if scripted), selected permissions and actual administrator coverage.
+3. Preview/review changes. Distinguish immediate creator/settings writes from
+   report-only CA creation and explicitly reviewed manual consent/guest changes.
+4. Apply selected core configuration; complete required state-aware follow-on
+   and native PIM settings. Review all errors, warnings, skips and effective state.
+5. Verify authentication/bootstrap readiness, registration toggle transition,
+   existing-policy migration and report-only impact. Refer to method/endpoint
+   guidance only for actual readiness gaps; do not mandate reconfiguration.
+6. Explicitly enable and validate **TCG01-TCG10** after approval, then attach the
+   PIM Admin context to applicable eligible role activation settings. Future
+   migration is not a gate. Configure monitoring through its owning TCG and remove
+   approved temporary deployment credentials when finished.
 
-### Group and Team owner consent is create-if-missing
+## Optional guidance and future notice
 
-Resource 4 creates the `Group.Unified` settings object only when one does not already exist.
-On a tenant that already has a `Group.Unified` object, verify `EnableGroupSpecificConsent`
-is `false` in the portal — the template will not overwrite an existing object, because
-group-settings updates replace the entire values collection and would reset other
-group-governance settings.
+| Item | Treatment |
+|---|---|
+| Five-or-fewer Global Administrators | Recommended minimization target, not hard cap; include emergency accounts and justify exceptions |
+| Exclude privileged AD accounts from sync | Recommended upstream AD Tier-0 hygiene; assess dependencies, no mandatory OU-move workstream |
+| Most-restrictive guest tier | Recommended tenant-specific tightening; check workload compatibility and preserve existing stricter state |
+| M365 group/Teams creator restriction | Optional Entra group-governance setting; security-group restriction does not block Team creation |
+| Designated M365 creators group | Optional only if creation restricted; reuse a suitable group and check applicable licensing |
+| Built-in admin-consent request workflow | Optional; existing organizational approval process acceptable |
+| Custom admin certificate strength / issuer / OID restrictions | Optional PKI-specific assurance; built-in PR-MFA remains the baseline |
+| Ordinary-user PR-MFA / passwordless | Optional readiness-driven expansion, not a mandatory second baseline |
+| Compliant-device Entra CA | Optional future device assurance with supported signals; no hybrid-join placeholder or endpoint integration recipe |
+| Manual configuration mapping | Optional alternative/reference, not a second mandatory configuration pass |
 
-### Authentication context c90
+**Future program requirement, not enforced by this release:** a subsequent
+baseline is planned to require cloud-native authentication for currently
+federated users. Administrators should assess dependencies and prepare. That
+baseline will define scope, timing, prerequisites and exceptions. This is program
+direction, not a universal Microsoft mandate or current go-live condition.
 
-The PIM Admin authentication context id `c90` is assumed unused in the target tenant. If it
-is already taken, change it in three places: the authentication-context resource, and the
-`includeAuthenticationContextClassReferences` condition of TCG10 and TCG11.
+Authentication-method combination matrices may be retained as **nonmandatory
+reference** with verified current strength definitions; use the linked Microsoft
+reference, not an assumption that every MFA claim or certificate combination
+meets phishing-resistant strength.
 
-### Not scripted (manual follow-on)
+Removed workstreams: unused external-users group provisioning in hardening;
+universal hybrid join; LinkedIn; portal-friction toggle; BitLocker owner-recovery
+and directory-read configuration steps; general guest reviews; Azure-role PIM;
+MDM/compliance integration recipes; compulsory Azure Files/SMB infrastructure.
+Removal from guidance does not authorize live setting changes.
 
-- **PIM role configuration** — run PIM Discovery and Insights, convert standing assignments
-  to eligible, and require the PIM Admin context (c90) on activation, through the portal.
-- **Admin consent workflow** — reviewers are tenant-specific; configure manually if wanted.
-- **LinkedIn account connections** and **admin-portal restriction** have no supported
-  Microsoft Graph v1.0 API and are portal-only.
+## Microsoft references
 
-## Idempotency and re-execution
-
-The template may be applied repeatedly. Each run reports its actions:
-
-- **Created** or **Found** — a new object was created, or an existing object was detected
-  and left unchanged.
-- **Applied** — a configure operation re-asserted the desired state, independent of whether
-  a change occurred.
-- **Skipped** — no action was required, or a create-if-missing resource already existed.
-- **Warning** — a guard or precondition was triggered.
-
-A read-only preview is available with `-WhatIf`; `-Verbose` additionally reports each
-Microsoft Graph request.
-
-## Go-live sequence
-
-1. Review with `-WhatIf`.
-2. Apply the template — all Conditional Access policies land in report-only.
-3. Populate the Emergency Access break-glass group with two or more cloud-only accounts.
-4. Configure authentication methods manually in the portal (add yourself + break-glass to any
-   pilot group before enabling/registering — see "Authentication methods are configured manually").
-5. Review report-only impact in the sign-in logs.
-6. Enable TCG01–TCG11 individually.
-7. Run PIM Discovery and Insights and convert standing access to eligible (manual).
+- [Default user permissions](https://learn.microsoft.com/entra/fundamentals/users-default-permissions)
+- [User consent and preserving other grant policies](https://learn.microsoft.com/entra/identity/enterprise-apps/configure-user-consent)
+- [Guest directory restrictions](https://learn.microsoft.com/entra/identity/users/users-restrict-guest-permissions)
+- [Emergency access](https://learn.microsoft.com/entra/identity/role-based-access-control/security-emergency-access)
+- [Sign-in risk policy](https://learn.microsoft.com/entra/identity/conditional-access/policy-risk-based-sign-in)
+- [User-risk remediation](https://learn.microsoft.com/entra/identity/conditional-access/policy-risk-based-user)
+- [Device-code restrictions](https://learn.microsoft.com/entra/identity/conditional-access/policy-block-authentication-flows)
+- [Security-info registration](https://learn.microsoft.com/entra/identity/conditional-access/policy-all-users-security-info-registration)
+- [Device registration and legacy MFA switch](https://learn.microsoft.com/entra/identity/conditional-access/policy-all-users-device-registration)
+- [Admin PR-MFA and role-targeting limits](https://learn.microsoft.com/entra/identity/conditional-access/policy-admin-phish-resistant-mfa)
+- [Built-in roles](https://learn.microsoft.com/entra/identity/role-based-access-control/permissions-reference)
+- [PIM settings, context ordering and reauthentication tolerance](https://learn.microsoft.com/entra/id-governance/privileged-identity-management/pim-how-to-change-default-settings)
+- [Authentication strengths](https://learn.microsoft.com/entra/identity/authentication/concept-authentication-strengths)
+- [Teams RSC: separate Teams-TCG implementation](https://learn.microsoft.com/microsoftteams/platform/graph-api/rsc/grant-resource-specific-consent)

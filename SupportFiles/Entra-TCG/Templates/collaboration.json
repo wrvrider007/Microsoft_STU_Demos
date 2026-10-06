@@ -1,7 +1,7 @@
 {
   "template": "collaboration",
   "version": "1.0.0",
-  "updated": "2026-09-14",
+  "updated": "2026-10-01",
   "description": "Cross-tenant community collaboration: admin-gated B2B, per-partner cross-tenant trust, dynamic/static groups, access-package gate, and staged outbound cross-tenant synchronization.",
   "graphScopes": {
     "delegated": [
@@ -89,8 +89,7 @@
         "body": {
           "inboundTrust": {
             "isMfaAccepted": true,
-            "isCompliantDeviceAccepted": true,
-            "isHybridAzureADJoinedDeviceAccepted": true
+            "isCompliantDeviceAccepted": false
           },
           "automaticUserConsentSettings": {
             "inboundAllowed": true,
@@ -120,7 +119,7 @@
       }
     },
     {
-      "name": "Cross-tenant access - default (block inbound except allow-list)",
+      "name": "Cross-tenant access - default (block unapproved inbound and Direct Connect)",
       "type": "crossTenantAccessPolicyDefault",
       "mode": "configure",
       "configure": {
@@ -136,6 +135,31 @@
               "accessType": "blocked",
               "targets": [{ "target": "AllApplications", "targetType": "application" }]
             }
+          },
+          "b2bDirectConnectInbound": {
+            "usersAndGroups": {
+              "accessType": "blocked",
+              "targets": [{ "target": "AllUsers", "targetType": "user" }]
+            },
+            "applications": {
+              "accessType": "blocked",
+              "targets": [{ "target": "AllApplications", "targetType": "application" }]
+            }
+          },
+          "b2bDirectConnectOutbound": {
+            "usersAndGroups": {
+              "accessType": "blocked",
+              "targets": [{ "target": "AllUsers", "targetType": "user" }]
+            },
+            "applications": {
+              "accessType": "blocked",
+              "targets": [{ "target": "AllApplications", "targetType": "application" }]
+            }
+          },
+          "inboundTrust": {
+            "isMfaAccepted": false,
+            "isCompliantDeviceAccepted": false,
+            "isHybridAzureADJoinedDeviceAccepted": false
           }
         }
       }
@@ -189,30 +213,6 @@
       }
     },
     {
-      "name": "Group - External Community Guests (dynamic)",
-      "type": "group",
-      "mode": "create",
-      "exists": {
-        "method": "GET",
-        "uri": "{{graph-endpoint}}/v1.0/groups?$filter=displayName eq 'External Community Guests'",
-        "match": "value[0]"
-      },
-      "create": {
-        "method": "POST",
-        "uri": "{{graph-endpoint}}/v1.0/groups",
-        "body": {
-          "displayName": "External Community Guests",
-          "description": "TCG - All guest users invited to collaborate with B2B (excludes synced members)",
-          "mailEnabled": false,
-          "mailNickname": "ExtCommunityGuests",
-          "securityEnabled": true,
-          "groupTypes": ["DynamicMembership"],
-          "membershipRule": "(user.userType -eq \"Guest\") and (user.userPrincipalName -contains \"#EXT#\")",
-          "membershipRuleProcessingState": "On"
-        }
-      }
-    },
-    {
       "name": "Group - Internal Members Only (dynamic)",
       "type": "group",
       "mode": "create",
@@ -237,31 +237,7 @@
       }
     },
     {
-      "name": "Group - External Community NOFORN (dynamic)",
-      "type": "group",
-      "mode": "create",
-      "exists": {
-        "method": "GET",
-        "uri": "{{graph-endpoint}}/v1.0/groups?$filter=displayName eq 'NOFORN - External Community'",
-        "match": "value[0]"
-      },
-      "create": {
-        "method": "POST",
-        "uri": "{{graph-endpoint}}/v1.0/groups",
-        "body": {
-          "displayName": "NOFORN - External Community",
-          "description": "TCG - All external users with country equals United States",
-          "mailEnabled": false,
-          "mailNickname": "NoFornExternal",
-          "securityEnabled": true,
-          "groupTypes": ["DynamicMembership"],
-          "membershipRule": "(user.country -eq \"United States\") and (user.userPrincipalName -contains \"#EXT#\")",
-          "membershipRuleProcessingState": "On"
-        }
-      }
-    },
-    {
-      "name": "Group - NOFORN Internal (dynamic)",
+      "name": "Group - NOFORN Internal",
       "type": "group",
       "captureAs": "noforInternal",
       "mode": "create",
@@ -275,37 +251,55 @@
         "uri": "{{graph-endpoint}}/v1.0/groups",
         "body": {
           "displayName": "NOFORN - Internal",
-          "description": "TCG - All internal members with country equals United States",
+          "description": "TCG - Governed internal users eligible to request NOFORN community collaboration; populate from an authoritative eligibility source",
           "mailEnabled": false,
           "mailNickname": "NoFornInternal",
           "securityEnabled": true,
-          "groupTypes": ["DynamicMembership"],
-          "membershipRule": "(user.country -eq \"United States\") and (user.userPrincipalName -notcontains \"#EXT#\") and (user.userType -eq \"Member\")",
-          "membershipRuleProcessingState": "On"
+          "groupTypes": []
         }
       }
     },
     {
-      "name": "Group - NOFORN ALL (dynamic)",
+      "name": "NOFORN Internal eligibility source (precondition)",
       "type": "group",
+      "mode": "assert",
+      "exists": {
+        "method": "GET",
+        "uri": "{{graph-endpoint}}/v1.0/groups?$filter=displayName eq 'NOFORN - Internal'",
+        "match": "value[0]"
+      },
+      "assert": {
+        "predicate": {
+          "path": "groupTypes",
+          "select": "[?@=='DynamicMembership']",
+          "mustBe": "emptyOrAbsent"
+        },
+        "onFail": {
+          "action": "warn",
+          "message": "Existing NOFORN - Internal is a dynamic-membership group. Verify the rule is based on an approved authoritative eligibility signal, such as a dedicated extension/custom security attribute or HR-fed field. Do not rely on generic profile country or usageLocation unless the customer has explicitly approved that attribute as authoritative for NOFORN eligibility."
+        }
+      }
+    },
+    {
+      "name": "Group - External Collaboration Blocked",
+      "type": "group",
+      "captureAs": "collaborationBlocked",
       "mode": "create",
       "exists": {
         "method": "GET",
-        "uri": "{{graph-endpoint}}/v1.0/groups?$filter=displayName eq 'NOFORN - All Community'",
+        "uri": "{{graph-endpoint}}/v1.0/groups?$filter=displayName eq 'External Collaboration Blocked'",
         "match": "value[0]"
       },
       "create": {
         "method": "POST",
         "uri": "{{graph-endpoint}}/v1.0/groups",
         "body": {
-          "displayName": "NOFORN - All Community",
-          "description": "TCG - All internal and external users with country equals United States",
+          "displayName": "External Collaboration Blocked",
+          "description": "TCG - Members cannot request the Community Collaboration - All access package",
           "mailEnabled": false,
-          "mailNickname": "NoFornAll",
+          "mailNickname": "ExternalCollaborationBlocked",
           "securityEnabled": true,
-          "groupTypes": ["DynamicMembership"],
-          "membershipRule": "(user.country -eq \"United States\")",
-          "membershipRuleProcessingState": "On"
+          "groupTypes": []
         }
       }
     },
@@ -417,10 +411,30 @@
       }
     },
     {
+      "name": "Access package incompatible group - External Collaboration Blocked",
+      "type": "accessPackageIncompatibleGroup",
+      "mode": "create",
+      "dependsOn": ["Access package - Community Collaboration - All", "Group - External Collaboration Blocked"],
+      "exists": {
+        "method": "GET",
+        "uri": "{{graph-endpoint}}/v1.0/identityGovernance/entitlementManagement/accessPackages/{{accessPackage.id}}/incompatibleGroups",
+        "match": "value[?id=='{{collaborationBlocked.id}}']|[0]"
+      },
+      "create": {
+        "method": "POST",
+        "uri": "{{graph-endpoint}}/v1.0/identityGovernance/entitlementManagement/accessPackages/{{accessPackage.id}}/incompatibleGroups/$ref",
+        "retryCount": 6,
+        "retryDelaySeconds": 15,
+        "body": {
+          "@odata.id": "{{graph-endpoint}}/v1.0/groups/{{collaborationBlocked.id}}"
+        }
+      }
+    },
+    {
       "name": "Policy - Community Collaboration - All (no approval)",
       "type": "accessPackageAssignmentPolicy",
       "mode": "create",
-      "dependsOn": ["Access package - Community Collaboration - All", "Group - NOFORN Internal (dynamic)"],
+      "dependsOn": ["Access package - Community Collaboration - All", "Group - NOFORN Internal"],
       "exists": {
         "method": "GET",
         "uri": "{{graph-endpoint}}/v1.0/identityGovernance/entitlementManagement/assignmentPolicies?$filter=displayName eq 'Request - Community Collaboration - All'",

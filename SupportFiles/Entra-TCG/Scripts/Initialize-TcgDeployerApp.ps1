@@ -20,6 +20,12 @@
       6. With -AcquireToken, signs in app-only with the certificate and RETURNS a Microsoft Graph
          access token as a SecureString, ready to pipe into Apply-GraphTemplate.ps1 -AccessToken.
 
+    With -Cleanup, skips setup and separately prompts for deletion of the app registration
+    (including its service principal and credentials) and the local PEM/key/certificate files.
+    Each deletion step requires an explicit 'y'. -WhatIf previews cleanup without prompting.
+    Setup records the selected app IDs, tenant, cloud, and certificate paths in
+    deployerAppConfig.json in the current directory. Cleanup uses this file, not name lookup.
+
     Requires the Azure CLI and a signed-in caller who is Global Administrator (or Privileged Role
     Administrator), because granting Microsoft Graph application permissions is privileged.
 
@@ -32,25 +38,23 @@
     Path to the JSON template whose application permission set to grant (e.g.
     ../Templates/hardening.json, or just hardening.json when files are uploaded flat to Cloud
     Shell). The app-role list is read from that template's graphScopes.application. Any template
-    works — not limited to the two shipped ones.
+    works — not limited to the two shipped ones. Not required or used with -Cleanup.
 
 .PARAMETER AppName
     Display name of the app registration to create or reuse. Default 'TCG Deployer'.
 
 .PARAMETER Environment
-    Cloud: Global (default), USGov, USGovDoD, or Custom. Selects the Azure CLI cloud, the Microsoft
-    Graph endpoint used for role assignment, and the token audience. For Custom, also pass
-    -CustomAzCloud and -CustomGraphEndpoint.
+    Cloud/endpoint name. Global, USGov, and USGovDoD are built in; any other name (e.g. a
+    sovereign/AGC cloud) must be defined in a clouds.json (see -CloudConfigPath). Selects the
+    Azure CLI cloud (azCloud), the Microsoft Graph endpoint used for role assignment, and the
+    token audience. Default Global.
 
-.PARAMETER CustomAzCloud
-    Required with -Environment Custom. The Azure CLI cloud name to activate via 'az cloud set
-    --name' (register it first with 'az cloud register' if it is not built in). Mirrors the
-    engine's sovereign/AGC support.
-
-.PARAMETER CustomGraphEndpoint
-    Required with -Environment Custom. That cloud's Microsoft Graph endpoint (e.g.
-    https://graph.microsoft.us or an AGC endpoint). Used as the token audience and the base URL
-    for the app-role-assignment calls.
+.PARAMETER CloudConfigPath
+    Optional path to a clouds.json defining named cloud endpoints
+    ({ "clouds": { "<name>": { graphEndpoint, loginHost, mgEnvironment, azCloud } } }). If
+    omitted, the script searches ..\Config\clouds.json, .\Config\clouds.json, and clouds.json
+    beside the script (the last covers flat Azure Cloud Shell uploads). File entries override
+    the built-in Global/USGov/USGovDoD definitions. A custom cloud needs graphEndpoint + azCloud.
 
 .PARAMETER CertPath
     Path to an existing certificate PEM (cert + private key) to reuse for sign-in. If omitted, a new
@@ -74,6 +78,14 @@
     SecureString on the pipeline (the script's only pipeline output). NOTE: this switches the active
     Azure CLI session to the service principal; run `az login` again to return as yourself.
 
+.PARAMETER Cleanup
+    Delete the app registration recorded in deployerAppConfig.json in the current directory and, in a separate confirmation step,
+    its local .pem, .key, and .crt files. Only 'y' approves either step. Requires a user Azure CLI
+    login authorized to delete the application; run `az login` after an -AcquireToken session.
+    Uses the recorded cloud and certificate paths; -AppName, -CertDir, and -CertPath do not
+    override cleanup targets. No template is needed. Missing config/object IDs or an application
+    that cannot be found cause an error before deletion. Missing local files are reported.
+
 .PARAMETER MaxVerifyAttempts
     How many times to re-check that all app roles are assigned before giving up (default 12).
 
@@ -95,23 +107,29 @@
         -CertPath ~/tcg-deployer.pem -AcquireToken
 
 .EXAMPLE
-    # Custom / sovereign / AGC cloud (register the cloud with 'az cloud register' first):
-    $token = ./Initialize-TcgDeployerApp.ps1 -TemplatePath ../Templates/hardening.json -Environment Custom `
-        -CustomAzCloud MyAgcCloud -CustomGraphEndpoint https://graph.example.gov -AcquireToken
+    # After deployment, sign back in as yourself and confirm the two cleanup steps:
+    az login
+    ./Initialize-TcgDeployerApp.ps1 -Cleanup
+
+.EXAMPLE
+    # Preview cleanup using deployerAppConfig.json without deleting anything:
+    ./Initialize-TcgDeployerApp.ps1 -Cleanup -WhatIf
+
+.EXAMPLE
+    # Custom / sovereign / AGC cloud (define it in Config/clouds.json, then reference by name;
+    # register the Azure CLI cloud with 'az cloud register' first if it is not built in):
+    $token = ./Initialize-TcgDeployerApp.ps1 -TemplatePath ../Templates/hardening.json -Environment Sovereign -AcquireToken
 #>
-[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium', DefaultParameterSetName = 'Setup')]
 param(
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $true, ParameterSetName = 'Setup')]
     [string] $TemplatePath,
 
     [string] $AppName = 'TCG Deployer',
 
-    [ValidateSet('Global', 'USGov', 'USGovDoD', 'Custom')]
     [string] $Environment = 'Global',
 
-    [string] $CustomAzCloud,
-
-    [string] $CustomGraphEndpoint,
+    [string] $CloudConfigPath,
 
     [string] $CertPath,
 
@@ -119,9 +137,14 @@ param(
 
     [int] $CertDays = 7,
 
+    [Parameter(ParameterSetName = 'Setup')]
     [switch] $NewCert,
 
+    [Parameter(ParameterSetName = 'Setup')]
     [switch] $AcquireToken,
+
+    [Parameter(Mandatory = $true, ParameterSetName = 'Cleanup')]
+    [switch] $Cleanup,
 
     [int] $MaxVerifyAttempts = 12,
 
@@ -131,23 +154,99 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+$DeployerConfigPath = Join-Path $PWD.Path 'deployerAppConfig.json'
+$deployerConfig = $null
+if (Test-Path -LiteralPath $DeployerConfigPath) {
+    $deployerConfig = Get-Content -LiteralPath $DeployerConfigPath -Raw | ConvertFrom-Json -AsHashtable
+    if ($deployerConfig -isnot [System.Collections.IDictionary]) {
+        throw "'$DeployerConfigPath' must contain a JSON object."
+    }
+}
+if ($Cleanup) {
+    if (-not $deployerConfig -or -not $deployerConfig.objectId) {
+        throw "Cleanup requires '$DeployerConfigPath' with an application objectId. No application or local files were deleted."
+    }
+    $parsedId = [guid]::Empty
+    if (-not [guid]::TryParse([string]$deployerConfig.objectId, [ref]$parsedId) -or $parsedId -eq [guid]::Empty) {
+        throw "'$DeployerConfigPath' contains an invalid application objectId."
+    }
+    if (-not $deployerConfig.tenantId -or -not $deployerConfig.environment -or -not $deployerConfig.pemPath) {
+        throw "'$DeployerConfigPath' must contain tenantId, environment, and pemPath for safe cleanup."
+    }
+    if ($PSBoundParameters.ContainsKey('Environment') -and $Environment -ne $deployerConfig.environment) {
+        throw "-Environment does not match the cloud recorded in '$DeployerConfigPath'."
+    }
+    $Environment = [string]$deployerConfig.environment
+}
+
 # Well-known Microsoft Graph resource app ID (identical across clouds).
 $GraphAppId = '00000003-0000-0000-c000-000000000000'
 
-# Cloud -> (Azure CLI cloud name, Microsoft Graph endpoint host).
-$CloudMap = @{
-    Global   = @{ AzCloud = 'AzureCloud';         Graph = 'https://graph.microsoft.com' }
-    USGov    = @{ AzCloud = 'AzureUSGovernment';   Graph = 'https://graph.microsoft.us' }
-    USGovDoD = @{ AzCloud = 'AzureUSGovernment';   Graph = 'https://dod-graph.microsoft.us' }
+# ---------------------------------------------------------------------------
+# Cloud / endpoint resolution
+#
+# Cloud definitions (Graph endpoint, login host, Graph SDK environment, Azure CLI
+# cloud name) come from a clouds.json file so sovereign/AGC endpoints live in config
+# instead of script parameters. The three public clouds are also defined in-script as
+# a fallback, so a clouds.json is only REQUIRED for a custom/sovereign cloud name.
+#
+# clouds.json search order:
+#   1. -CloudConfigPath (explicit)
+#   2. <script>\..\Config\clouds.json   (repo layout: Scripts\ beside Config\)
+#   3. <script>\Config\clouds.json
+#   4. <script>\clouds.json             (flat Azure Cloud Shell upload)
+# File entries override built-ins of the same name.
+# ---------------------------------------------------------------------------
+$BuiltInClouds = @{
+    Global   = @{ graphEndpoint = 'https://graph.microsoft.com';   loginHost = 'login.microsoftonline.com'; mgEnvironment = 'Global';   azCloud = 'AzureCloud' }
+    USGov    = @{ graphEndpoint = 'https://graph.microsoft.us';     loginHost = 'login.microsoftonline.us';  mgEnvironment = 'USGov';    azCloud = 'AzureUSGovernment' }
+    USGovDoD = @{ graphEndpoint = 'https://dod-graph.microsoft.us'; loginHost = 'login.microsoftonline.us';  mgEnvironment = 'USGovDoD'; azCloud = 'AzureUSGovernment' }
 }
-if ($Environment -eq 'Custom') {
-    if (-not $CustomAzCloud -or -not $CustomGraphEndpoint) {
-        throw "-Environment Custom requires -CustomAzCloud (a cloud name registered with 'az cloud register'/'az cloud set') and -CustomGraphEndpoint (that cloud's Microsoft Graph endpoint, e.g. an Azure Government/sovereign or AGC endpoint)."
+
+function Resolve-CloudConfig {
+    param([Parameter(Mandatory = $true)][string] $Name, [string] $ConfigPath)
+
+    $candidates = @()
+    if ($ConfigPath) { $candidates += $ConfigPath }
+    if ($PSScriptRoot) {
+        $candidates += (Join-Path (Split-Path $PSScriptRoot -Parent) 'Config/clouds.json')
+        $candidates += (Join-Path $PSScriptRoot 'Config/clouds.json')
+        $candidates += (Join-Path $PSScriptRoot 'clouds.json')
     }
-    $CloudMap['Custom'] = @{ AzCloud = $CustomAzCloud; Graph = $CustomGraphEndpoint.TrimEnd('/') }
+
+    $fileClouds = @{}
+    $foundPath  = $null
+    foreach ($c in $candidates) {
+        if ($c -and (Test-Path -LiteralPath $c)) { $foundPath = $c; break }
+    }
+    if ($foundPath) {
+        try { $doc = Get-Content -Raw -LiteralPath $foundPath | ConvertFrom-Json }
+        catch { throw "Cloud config '$foundPath' is not valid JSON: $($_.Exception.Message)" }
+        $node = if ($doc.PSObject.Properties.Name -contains 'clouds') { $doc.clouds } else { $doc }
+        foreach ($p in $node.PSObject.Properties) {
+            if ($p.Name -eq '$schema') { continue }
+            $h = @{}
+            foreach ($f in $p.Value.PSObject.Properties) { $h[$f.Name] = $f.Value }
+            $fileClouds[$p.Name] = $h
+        }
+    }
+
+    if     ($fileClouds.ContainsKey($Name))    { $entry = $fileClouds[$Name] }
+    elseif ($BuiltInClouds.ContainsKey($Name)) { $entry = $BuiltInClouds[$Name] }
+    else {
+        $known    = ((@($BuiltInClouds.Keys) + @($fileClouds.Keys)) | Select-Object -Unique | Sort-Object) -join ', '
+        $searched = ($candidates | Where-Object { $_ }) -join '; '
+        throw "Unknown -Environment '$Name'. Known clouds: $known. Define a custom/sovereign cloud in a clouds.json (searched: $searched)."
+    }
+    if ($entry.graphEndpoint) { $entry.graphEndpoint = ([string]$entry.graphEndpoint).TrimEnd('/') }
+    return $entry
 }
-$Cloud     = $CloudMap[$Environment]
-$GraphHost = $Cloud.Graph
+
+$Cloud     = Resolve-CloudConfig -Name $Environment -ConfigPath $CloudConfigPath
+if (-not $Cloud.graphEndpoint -or -not $Cloud.azCloud) {
+    throw "Cloud '$Environment' must define both graphEndpoint and azCloud (check your clouds.json)."
+}
+$GraphHost = $Cloud.graphEndpoint
 
 # ---------------------------------------------------------------------------
 # Console reporting helpers (all go to the host, NOT the pipeline, so -AcquireToken's
@@ -158,6 +257,13 @@ function Write-Ok   { param([string] $Message) Write-Host "    [ok]   $Message" 
 function Write-Info { param([string] $Message) Write-Host "    [info] $Message" -ForegroundColor DarkGray }
 function Write-Warn { param([string] $Message) Write-Host "    [warn] $Message" -ForegroundColor Yellow }
 
+function Get-CertificateSlug {
+    param([string] $Name)
+    $slug = ($Name.ToLower() -replace '[^a-z0-9]+', '-').Trim('-')
+    if (-not $slug) { $slug = 'tcg-deployer' }
+    return $slug
+}
+
 function Write-CleanupGuidance {
     # Post-deployment cleanup: this app + certificate is a privileged, throwaway deployment
     # credential. The recommended teardown is to delete the whole app registration so nothing
@@ -165,13 +271,12 @@ function Write-CleanupGuidance {
     param([string] $AppId, [string] $CertFile)
     Write-Host ""
     Write-Host "Post-deployment cleanup (do this once the deployment is complete):" -ForegroundColor Yellow
-    Write-Host "  # Recommended - delete the whole throwaway app registration (removes SP + all creds):"
-    Write-Host ("  az ad app delete --id {0}" -f $AppId)
-    if ($CertFile) {
-        $base = [IO.Path]::Combine([IO.Path]::GetDirectoryName($CertFile), [IO.Path]::GetFileNameWithoutExtension($CertFile))
-        Write-Host "  # And delete the local key/cert/PEM files from Cloud Shell:"
-        Write-Host ("  rm -f {0}.key {0}.crt {0}.pem" -f $base)
-    }
+    Write-Host "  # Sign back in as yourself, then confirm app deletion and local certificate deletion separately:"
+    Write-Host "  az login"
+    $recipe = "./Initialize-TcgDeployerApp.ps1 -Cleanup"
+    if ($CloudConfigPath) { $recipe += " -CloudConfigPath '{0}'" -f $CloudConfigPath.Replace("'", "''") }
+    Write-Host "  $recipe"
+    Write-Info "Run cleanup from the directory containing $DeployerConfigPath."
     Write-Host "  # (If you must keep the app, remove just its certificate instead:)"
     Write-Host ("  #   az ad app credential list --id {0} --cert --query '[].keyId' -o tsv" -f $AppId)
     Write-Host ("  #   az ad app credential delete --id {0} --key-id <keyId> --cert" -f $AppId)
@@ -184,8 +289,8 @@ function Get-JsonPayload {
     param([string] $Text)
     if (-not $Text) { return $null }
     $startObj = $Text.IndexOf('{'); $startArr = $Text.IndexOf('[')
-    $candidates = @($startObj, $startArr) | Where-Object { $_ -ge 0 }
-    if (-not $candidates) { return $null }
+    $candidates = @(@($startObj, $startArr) | Where-Object { $_ -ge 0 })
+    if ($candidates.Count -eq 0) { return $null }
     $start = ($candidates | Measure-Object -Minimum).Minimum
     $open  = $Text[$start]
     $close = if ($open -eq '{') { '}' } else { ']' }
@@ -197,9 +302,11 @@ function Get-JsonPayload {
 function Invoke-Az {
     # Runs the Azure CLI and returns parsed JSON (or raw text with -Raw). Throws on failure.
     param([Parameter(Mandatory)][string[]] $CliArgs, [switch] $Raw)
+    # Internal diagnostic files must still work when the caller previews with -WhatIf.
+    $WhatIfPreference = $false
     # Route stderr to its own temp file so az WARNING: text never merges into the stdout we parse;
     # --only-show-errors suppresses most warnings; Get-JsonPayload strips any residual preamble.
-    $errFile = New-TemporaryFile
+    $errFile = New-TemporaryFile -WhatIf:$false -Confirm:$false
     try {
         $stdout = (& az @CliArgs --only-show-errors 2>$errFile | Out-String)
         $code = $LASTEXITCODE
@@ -208,7 +315,7 @@ function Invoke-Az {
             throw ("az {0} failed:`n{1}`n{2}" -f ($CliArgs -join ' '), $stdout.Trim(), ($err | Out-String).Trim())
         }
     }
-    finally { Remove-Item $errFile -Force -ErrorAction SilentlyContinue }
+    finally { Remove-Item $errFile -Force -WhatIf:$false -Confirm:$false -ErrorAction SilentlyContinue }
     if ($Raw) { return $stdout.Trim() }
     $json = Get-JsonPayload -Text $stdout
     if (-not $json) { return $null }
@@ -255,8 +362,8 @@ Write-Step "Preflight: Azure CLI, cloud, and sign-in"
 if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
     throw "Azure CLI ('az') was not found on PATH. Install it or run from Azure Cloud Shell."
 }
-Invoke-Az -CliArgs @('cloud', 'set', '--name', $Cloud.AzCloud) | Out-Null
-Write-Ok ("Azure CLI cloud set to {0} (Graph endpoint {1})" -f $Cloud.AzCloud, $GraphHost)
+Invoke-Az -CliArgs @('cloud', 'set', '--name', $Cloud.azCloud) | Out-Null
+Write-Ok ("Azure CLI cloud set to {0} (Graph endpoint {1})" -f $Cloud.azCloud, $GraphHost)
 $account = Invoke-Az -CliArgs @('account', 'show')
 if (-not $account) { throw "No active Azure CLI login. Run 'az login' as your Global Administrator user, then re-run." }
 
@@ -280,9 +387,94 @@ if ($account.PSObject.Properties.Name -contains 'user' -and $account.user) {
     if ($account.user.PSObject.Properties.Name -contains 'type' -and $account.user.type) { $userType = $account.user.type }
 }
 if ($userType -eq 'servicePrincipal') {
+    if ($Cleanup) {
+        throw "Azure CLI is signed in as a service principal. Run 'az login' as a user authorized to delete the deployer application, then re-run with -Cleanup."
+    }
     throw ("Azure CLI is currently signed in as a SERVICE PRINCIPAL ({0}), not your user account. This happens after a prior -AcquireToken run (which logs in as the app). Granting Microsoft Graph app roles needs YOUR Global Administrator role, so run:`n    az login`nas your GA user, then re-run this script." -f $userName)
 }
 Write-Ok ("Signed in to tenant {0} as {1}" -f $TenantId, $userName)
+
+if ($Cleanup) {
+    if ($TenantId -ne $deployerConfig.tenantId) {
+        throw "The active Azure CLI tenant does not match '$DeployerConfigPath'. Sign in to the recorded tenant before cleanup."
+    }
+    $cleanupPem = [string]$deployerConfig.pemPath
+    if (-not [IO.Path]::IsPathFullyQualified($cleanupPem)) {
+        throw "The recorded pemPath must be an absolute local file path."
+    }
+    if ([IO.Path]::GetExtension($cleanupPem) -ine '.pem') {
+        throw "The recorded pemPath must identify a .pem file. No application or local files were deleted."
+    }
+    $certificateFiles = @(
+        $cleanupPem
+    )
+    foreach ($field in @('keyPath', 'crtPath')) {
+        if ($deployerConfig[$field]) {
+            $file = [string]$deployerConfig[$field]
+            $extension = if ($field -eq 'keyPath') { '.key' } else { '.crt' }
+            if (-not [IO.Path]::IsPathFullyQualified($file) -or
+                $file -ine [IO.Path]::ChangeExtension($cleanupPem, $extension)) {
+                throw "The recorded $field must be the $extension companion of pemPath."
+            }
+            $certificateFiles += $file
+        }
+    }
+    foreach ($file in $certificateFiles) {
+        if (Test-Path -LiteralPath $file -PathType Container) {
+            throw "Cleanup target '$file' is a directory, not a certificate file. No application or local files were deleted."
+        }
+    }
+    $cleanupApp = Invoke-Az -CliArgs @('ad', 'app', 'show', '--id', [string]$deployerConfig.objectId)
+    if (-not $cleanupApp -or $cleanupApp.id -ne $deployerConfig.objectId) {
+        throw "The application object recorded in '$DeployerConfigPath' could not be found. No application or local files were deleted."
+    }
+    if ($deployerConfig.appId -and $cleanupApp.appId -ne $deployerConfig.appId) {
+        throw "The application client ID does not match '$DeployerConfigPath'. No application or local files were deleted."
+    }
+    $AppName = $cleanupApp.displayName
+    $applicationDeleted = $false
+    $filesDeleted = $false
+
+    Write-Step "1. Delete the app registration (including its service principal and all credentials)"
+    $cleanupAppId = [string]$deployerConfig.objectId
+    $target = "'$AppName' (objectId $cleanupAppId, tenant $TenantId)"
+    if ($PSCmdlet.ShouldProcess($target, 'Delete app registration, service principal, and all credentials')) {
+        $answer = Read-Host "Delete ${target}? Type y to continue (anything else skips)"
+        if ($answer.Trim() -ieq 'y') {
+            Invoke-Az -CliArgs @('ad', 'app', 'delete', '--id', $cleanupAppId) | Out-Null
+            $applicationDeleted = $true
+            Write-Ok "Deleted app registration '$AppName' and its service principal."
+        }
+        else { Write-Warn "Application deletion skipped; the app and its credentials remain." }
+    }
+
+    Write-Step "2. Delete the local PEM, private-key, and public-certificate files"
+    $existingFiles = @($certificateFiles | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
+    foreach ($file in $certificateFiles) {
+        if ($existingFiles -contains $file) { Write-Info "Delete target: $file" }
+        else { Write-Info "Not found: $file" }
+    }
+    if ($existingFiles.Count -eq 0) {
+        Write-Info "No local certificate files found; nothing to delete."
+        $filesDeleted = $true
+    }
+    elseif ($PSCmdlet.ShouldProcess(($existingFiles -join '; '), 'Delete local certificate files')) {
+        $answer = Read-Host "Delete the listed local certificate files? Type y to continue (anything else skips)"
+        if ($answer.Trim() -ieq 'y') {
+            Remove-Item -LiteralPath $existingFiles -Force -Confirm:$false
+            $filesDeleted = $true
+            Write-Ok "Deleted the listed local certificate files."
+        }
+        else { Write-Warn "Local certificate deletion skipped; the files remain." }
+    }
+    if ($applicationDeleted -and $filesDeleted) {
+        Remove-Item -LiteralPath $DeployerConfigPath -Force -Confirm:$false
+        Write-Ok "Removed deployerAppConfig.json after completing both cleanup steps."
+    }
+    else { Write-Info "Retained deployerAppConfig.json because cleanup was not completed." }
+    return
+}
+
 Write-Info "Granting Graph application permissions requires Global Administrator (or Privileged Role Administrator)."
 
 # ---------------------------------------------------------------------------
@@ -325,9 +517,16 @@ $resolved.Keys | Sort-Object | ForEach-Object { Write-Info $_ }
 # ---------------------------------------------------------------------------
 Write-Step ("Creating or reusing app registration '{0}'" -f $AppName)
 $existingApps = Invoke-Az -CliArgs @('ad', 'app', 'list', '--display-name', $AppName, '--query', '[].{appId:appId,id:id}')
+if ($deployerConfig -and (
+    $deployerConfig.tenantId -ne $TenantId -or $deployerConfig.environment -ne $Environment -or
+    -not $existingApps -or $deployerConfig.objectId -ne @($existingApps)[0].id)) {
+    throw "'$DeployerConfigPath' records a different application, tenant, or cloud. Use a separate working directory or move the existing config before setup."
+}
 $appId = $null
+$appObjectId = $null
 if ($existingApps -and @($existingApps).Count -ge 1) {
     $appId = @($existingApps)[0].appId
+    $appObjectId = @($existingApps)[0].id
     Write-Ok ("Reusing app registration (appId {0})" -f $appId)
     if (@($existingApps).Count -gt 1) { Write-Warn ("{0} apps share the name '{1}'; using the first. Pass a unique -AppName to disambiguate." -f @($existingApps).Count, $AppName) }
 }
@@ -335,9 +534,25 @@ else {
     if ($PSCmdlet.ShouldProcess($AppName, "Create app registration")) {
         $app = Invoke-Az -CliArgs @('ad', 'app', 'create', '--display-name', $AppName)
         $appId = $app.appId
+        $appObjectId = $app.id
         Write-Ok ("Created app registration (appId {0})" -f $appId)
     }
     else { Write-Warn "Skipped app creation (-WhatIf). Cannot continue."; return }
+}
+
+if (-not $appObjectId) { throw "The selected app registration did not return an application object ID." }
+if ($PSCmdlet.ShouldProcess($DeployerConfigPath, 'Record deployer application configuration')) {
+    $deployerConfig = [ordered]@{
+        objectId = $appObjectId
+        appId = $appId
+        appName = $AppName
+        tenantId = $TenantId
+        environment = $Environment
+        pemPath = if ($deployerConfig) { $deployerConfig.pemPath } else { $null }
+        keyPath = if ($deployerConfig) { $deployerConfig.keyPath } else { $null }
+        crtPath = if ($deployerConfig) { $deployerConfig.crtPath } else { $null }
+    }
+    $deployerConfig | ConvertTo-Json | Set-Content -LiteralPath $DeployerConfigPath -Encoding utf8
 }
 
 # Ensure the service principal exists for this app.
@@ -369,8 +584,7 @@ else {
             throw "openssl was not found on PATH. It is preinstalled in Azure Cloud Shell; install it or pass -CertPath to an existing PEM (cert + private key)."
         }
         # Deterministic file names derived from the app display name.
-        $slug    = ($AppName.ToLower() -replace '[^a-z0-9]+', '-').Trim('-')
-        if (-not $slug) { $slug = 'tcg-deployer' }
+        $slug    = Get-CertificateSlug -Name $AppName
         $keyPath = Join-Path $CertDir "$slug.key"   # private key (stays local)
         $crtPath = Join-Path $CertDir "$slug.crt"   # public certificate (uploaded to the app)
         $pemPath = Join-Path $CertDir "$slug.pem"   # combined cert + key (for az login --certificate)
@@ -395,6 +609,19 @@ else {
         Write-Info "The private key never left this session; only the public certificate was uploaded. No client secret was created."
     }
     else { Write-Warn "Skipped certificate creation (-WhatIf)." }
+}
+
+if ($CertPath -and (Test-Path -LiteralPath $CertPath -PathType Leaf) -and
+    $PSCmdlet.ShouldProcess($DeployerConfigPath, 'Record local certificate paths')) {
+    $pemFile = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($CertPath)
+    $deployerConfig.pemPath = $pemFile
+    foreach ($field in @('keyPath', 'crtPath')) {
+        $extension = if ($field -eq 'keyPath') { '.key' } else { '.crt' }
+        $file = [IO.Path]::ChangeExtension($pemFile, $extension)
+        $deployerConfig[$field] = if (Test-Path -LiteralPath $file -PathType Leaf) { $file } else { $null }
+    }
+    $deployerConfig | ConvertTo-Json | Set-Content -LiteralPath $DeployerConfigPath -Encoding utf8
+    Write-Ok "Recorded app IDs and local certificate paths in $DeployerConfigPath."
 }
 
 # ---------------------------------------------------------------------------

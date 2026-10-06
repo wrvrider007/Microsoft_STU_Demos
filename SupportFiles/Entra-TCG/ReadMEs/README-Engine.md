@@ -3,7 +3,9 @@
 A generic, idempotent PowerShell engine that applies declarative JSON templates to
 Microsoft Entra via `Invoke-MgGraphRequest`. The engine has **no domain knowledge** —
 every resource, URL, and payload lives in the template. The same engine drives
-`collaboration.json`, `hardening.json`, or any future template.
+`collaboration.json`, required `hardening.json`, or any future template.
+Hardening's required
+manual/state-aware follow-on steps are documented in **README-Hardening.md**.
 
 > Requires **PowerShell 7+** and the **Microsoft.Graph.Authentication** module
 > (`Install-Module Microsoft.Graph -Scope CurrentUser`).
@@ -17,7 +19,8 @@ The engine:
 
 1. Resolves the target **partners** (from `-Domain` / `-TenantId`).
 2. Connects to Graph. In **delegated** sign-in it requests `graphScopes.delegated` (read-only
-   equivalents under `-WhatIf`). With an **`-AccessToken`**, an app-only token is validated
+   equivalents where mapped under `-WhatIf`; unmapped scopes remain unchanged).
+   With an **`-AccessToken`**, an app-only token is validated
    against `graphScopes.application` and a delegated token against `graphScopes.delegated`.
 3. Walks `resources` **in array order**, applying each one **idempotently** based on
    the blocks it declares (`exists`, `create`, `configure`, `assert`, `roleScope`, …).
@@ -31,9 +34,11 @@ The engine:
 > app-only-only permissions **out of the delegated consent request**. A legacy flat array
 > (`"graphScopes": [...]`) is still accepted and treated as the delegated set.
 
-Idempotency model: the engine **checks then acts**. `create` resources only POST when
+Idempotency model: the engine **checks then acts**. `create` resources only write when
 `exists` finds nothing; `configure` resources PATCH/PUT the desired state every run
-(drift correction). Re-running is always safe.
+(drift correction). Existing `create` objects are not updated, renamed, or verified
+against the body. Reapplication is not a complete drift-reconciliation pass.
+Review `configure` writes, which can immediately reassert tenant-wide settings.
 
 ---
 
@@ -44,10 +49,10 @@ Idempotency model: the engine **checks then acts**. `create` resources only POST
 | `-TemplatePath <path>` | **Required.** Template to apply. Must exist and contain valid JSON (validated before connecting to Graph). |
 | `-Domain <string[]>` | One or more partner domains; resolved to tenant IDs via the OIDC metadata endpoint. |
 | `-TenantId <string[]>` | One or more partner tenant IDs (GUIDs). Combine freely with `-Domain`. |
-| `-Environment <name>` | `Global` (default), `USGov`, `USGovDoD`, or `Custom`. |
-| `-CustomGraphEndpoint`, `-CustomLoginHost`, `-CustomMgEnvironment` | Required when `-Environment Custom` (e.g. an AGC/sovereign cloud). |
+| `-Environment <name>` | `Global` (default), `USGov`, and `USGovDoD` are built in; any other name (e.g. an AGC/sovereign cloud) must be defined in a `clouds.json` (see `-CloudConfigPath`). |
+| `-CloudConfigPath <path>` | Optional path to a `clouds.json` mapping cloud names to `{ graphEndpoint, loginHost, mgEnvironment, azCloud }`. If omitted, the script searches `..\Config\clouds.json`, `.\Config\clouds.json`, and `clouds.json` beside the script (the last covers flat Cloud Shell uploads). File entries override the built-in three. |
 | `-AccessToken <securestring>` | Authenticate Graph with a **pre-acquired access token** instead of Graph PowerShell's interactive/device-code sign-in — for environments where that flow is broken (e.g. Azure Cloud Shell in some clouds). Acquire the token however you like (an app registration with the template's Graph **application** permissions is recommended); its audience must match `-Environment`. The engine decodes and validates the token's roles/scopes. See [CloudShellDeployment.md](CloudShellDeployment.md). |
-| `-WhatIf` | Preview. Reads state, shows would-do actions, commits nothing, requests **read-only** scopes only. |
+| `-WhatIf` | Preview. Reads state, shows would-do actions, commits nothing. Maps supported delegated write scopes to read equivalents; unmapped scopes and supplied-token privileges remain unchanged. |
 | `-StopOnError` | Halt on first failure. Default is **continue-and-report** (exit code 1 if any errors). |
 | `-Verbose` | Also print the exact `METHOD uri` for each action. |
 
@@ -61,7 +66,7 @@ endpoint, so one template works across clouds.
 .\Apply-GraphTemplate.ps1 -TemplatePath .\collaboration.json -Domain fabrikam.com,contoso.com
 .\Apply-GraphTemplate.ps1 -TemplatePath .\hardening.json -WhatIf
 .\Apply-GraphTemplate.ps1 -TemplatePath .\collaboration.json -TenantId 1111...,2222... -Environment USGov -Verbose
-.\Apply-GraphTemplate.ps1 -TemplatePath .\collaboration.json -Environment Custom -CustomGraphEndpoint https://graph.example -CustomLoginHost login.example
+.\Apply-GraphTemplate.ps1 -TemplatePath .\collaboration.json -Environment Sovereign   # 'Sovereign' defined in Config\clouds.json
 ```
 
 ---
@@ -103,6 +108,9 @@ A single lookup **or an ordered array** of lookups (first match wins):
 - **`capture`** — pull fields from the response into named tokens.
 - **`notFoundStatuses`** — statuses treated as "not found" instead of errors (default `404`).
 - Provide an **array** of lookups to try a primary key then a fallback.
+- Hardening uses full new/legacy policy names to avoid duplicating known legacy
+  controls after renumbering. A fallback hit is still unchanged; migration and
+  effective-control verification remain separate approved steps.
 
 ### `match` mini-expression grammar
 

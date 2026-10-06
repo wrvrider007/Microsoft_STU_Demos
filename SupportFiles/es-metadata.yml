@@ -1,0 +1,69 @@
+# This is a sample EsMetadata 1.0.0 file with an InventoryAsConfig provider.
+# * It documents usage and syntax for the configuration.
+# * Provides example data.
+# Inventory consists of:
+# * Classification
+# * Ownership
+# * Routing
+
+# schemaVersion is required
+schemaVersion: 1.0.0
+
+# schemaVersion 1.0.0 introduces the concept of providers allowing other registered providers
+# to include metadata in the EsMetadata file.
+providers:
+# InventoryAsCode is the name of the Inventory As Code provider.
+# * provider is required.
+- provider: InventoryAsCode
+  # The current provider version for Inventory As Code is 1.0.0.
+  # * version is required.
+  version: 1.0.0
+  # The metadata property contains YAML metadata for a provider section.
+  # * metadata is required for the InventoryAsCode provider.
+  metadata:
+    # isProduction (Classification) - Declares whether the code is production or non-production.
+    # * isProduction is required.
+    isProduction: false
+
+    # includeSubfolders controls whether this directory inventory continues to apply
+    # to child folders. Optional. Defaults to true when omitted.
+    includeSubfolders: true
+
+    # accountableOwners (Ownership) specifies responsible owners via service ownership or direct ownership
+    # * accountableOwners is required.
+    accountableOwners:
+      # Option 1: service is the unique identifier for a service. This is the service ID from Service Tree (aka.ms/servicetree).
+      # Option 2: directOwners allows specifying direct ownership without a Service Tree service (non-production only)
+      # Requires at least 2 email addresses. Does not sync back to Product Catalog.
+      directOwners:
+        - andrmass@microsoft.com
+        - Joseph.Zerafa@microsoft.com
+
+    # routing (Routing) provides routing information for work items (bugs, etc).
+    # Exactly one routing target must be selected: defaultAreaPath XOR gitHubIssue.
+    # * routing is required.
+    routing:
+      # Option 1: defaultAreaPath - An ADO AreaPath. This routes work items to ADO.
+      defaultAreaPath:
+        # * path (required) - e.g. `Some\Area\Path`
+        # * org (optional) - If not supplied, the org will be assumed from the repo. This enables routing to area paths in other orgs.
+        path: IC-CIO-ZT
+      # Option 2: gitHubIssue - Routes work items to GitHub issues instead of ADO.
+      # Mutually exclusive with defaultAreaPath. To default to the current repo, use an empty mapping: gitHubIssue: {}
+      # gitHubIssue:
+      #   # domain (optional) - base domain of the target GitHub repo. Defaults to the source repo domain.
+      #   domain: microsoft.ghe.com
+      #   # org (optional) - target GitHub org. Defaults to the source repo org.
+      #   org: my-github-org
+      #   # repositoryName (optional) - target GitHub repo name. Defaults to the source repo name.
+      #   repositoryName: my-repo
+      #   # repositoryId (optional, strongly recommended) - immutable numeric GitHub repo ID.
+      #   repositoryId: 1296269
+      #
+      # For ADO source repos using gitHubIssue, domain + org + (repositoryName or repositoryId) are required.
+
+    # files (File inventory) applies to specific files in the current folder.
+    # Optional. Each entry can override any subset of Classification, Ownership, and Routing.
+    # Omitted fields inherit from the containing folder inventory unless explicitly overridden.
+    # A file entry's routing can use defaultAreaPath or gitHubIssue (same shape as the directory routing above).
+    #consuming services is an optional inventory detail specified at the root of a repository. These services rely on the repository’s code but do not own any part of it

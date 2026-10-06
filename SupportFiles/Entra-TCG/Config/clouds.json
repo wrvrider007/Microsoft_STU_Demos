@@ -1,0 +1,29 @@
+{
+  "_readme": "Cloud/endpoint definitions consumed by the Entra-TCG scripts (Apply-GraphTemplate.ps1, Start-CommunitySync.ps1, Initialize-TcgDeployerApp.ps1). Each key under 'clouds' is an -Environment name. To add a cloud offline, copy an entry, rename the key, and fill in the four fields: graphEndpoint (Microsoft Graph base URL / token audience), loginHost (OIDC login host), mgEnvironment (Microsoft.Graph SDK environment name), azCloud (Azure CLI cloud name for 'az cloud set'). Global/USGov/USGovDoD are also built into the scripts as a fallback; entries here override the built-in of the same name.",
+  "clouds": {
+    "Global": {
+      "graphEndpoint": "https://graph.microsoft.com",
+      "loginHost": "login.microsoftonline.com",
+      "mgEnvironment": "Global",
+      "azCloud": "AzureCloud"
+    },
+    "USGov": {
+      "graphEndpoint": "https://graph.microsoft.us",
+      "loginHost": "login.microsoftonline.us",
+      "mgEnvironment": "USGov",
+      "azCloud": "AzureUSGovernment"
+    },
+    "USGovDoD": {
+      "graphEndpoint": "https://dod-graph.microsoft.us",
+      "loginHost": "login.microsoftonline.us",
+      "mgEnvironment": "USGovDoD",
+      "azCloud": "AzureUSGovernment"
+    },
+    "Sovereign": {
+      "graphEndpoint": "https://graph.example.gov",
+      "loginHost": "login.example.gov",
+      "mgEnvironment": "SovCloud",
+      "azCloud": "MySovereignCloud"
+    }
+  }
+}

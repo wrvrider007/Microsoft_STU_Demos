@@ -24,16 +24,15 @@
     One or more partner tenant IDs (GUIDs).
 
 .PARAMETER Environment
-    Graph/cloud environment: Global, USGov, USGovDoD, Custom. Default Global.
+    Cloud/endpoint name. Global, USGov, and USGovDoD are built in; any other name
+    (e.g. a sovereign/AGC cloud) must be defined in a clouds.json (see -CloudConfigPath).
+    Default Global.
 
-.PARAMETER CustomGraphEndpoint
-    Required when -Environment Custom. Graph base URL for a sovereign/AGC cloud.
-
-.PARAMETER CustomLoginHost
-    Required when -Environment Custom. Login host for a sovereign/AGC cloud.
-
-.PARAMETER CustomMgEnvironment
-    Microsoft.Graph environment name to connect with when -Environment Custom. Default Global.
+.PARAMETER CloudConfigPath
+    Optional path to a clouds.json defining named cloud endpoints. If omitted, the
+    script searches ..\Config\clouds.json, .\Config\clouds.json, and clouds.json beside
+    the script (the last covers flat Azure Cloud Shell uploads). File entries override
+    the built-in Global/USGov/USGovDoD definitions.
 
 .PARAMETER WhatIf
     Shows what would validate/start without committing.
@@ -49,33 +48,80 @@ param(
     [string[]] $Domain,
     [string[]] $TenantId,
 
-    [ValidateSet('Global', 'USGov', 'USGovDoD', 'Custom')]
     [string] $Environment = 'Global',
 
-    [string] $CustomGraphEndpoint,
-
-    [string] $CustomLoginHost,
-
-    [string] $CustomMgEnvironment = 'Global'
+    [string] $CloudConfigPath
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$EnvMap = @{
-    Global   = @{ GraphEndpoint = 'https://graph.microsoft.com';            Login = 'login.microsoftonline.com'; MgEnvironment = 'Global'   }
-    USGov    = @{ GraphEndpoint = 'https://graph.microsoft.us';              Login = 'login.microsoftonline.us';  MgEnvironment = 'USGov'    }
-    USGovDoD = @{ GraphEndpoint = 'https://dod-graph.microsoft.us';          Login = 'login.microsoftonline.us';  MgEnvironment = 'USGovDoD' }
+# ---------------------------------------------------------------------------
+# Cloud / endpoint resolution
+#
+# Cloud definitions (Graph endpoint, login host, Graph SDK environment, Azure CLI
+# cloud name) come from a clouds.json file so sovereign/AGC endpoints live in config
+# instead of script parameters. The three public clouds are also defined in-script as
+# a fallback, so a clouds.json is only REQUIRED for a custom/sovereign cloud name.
+#
+# clouds.json search order:
+#   1. -CloudConfigPath (explicit)
+#   2. <script>\..\Config\clouds.json   (repo layout: Scripts\ beside Config\)
+#   3. <script>\Config\clouds.json
+#   4. <script>\clouds.json             (flat Azure Cloud Shell upload)
+# File entries override built-ins of the same name.
+# ---------------------------------------------------------------------------
+$BuiltInClouds = @{
+    Global   = @{ graphEndpoint = 'https://graph.microsoft.com';   loginHost = 'login.microsoftonline.com'; mgEnvironment = 'Global';   azCloud = 'AzureCloud' }
+    USGov    = @{ graphEndpoint = 'https://graph.microsoft.us';     loginHost = 'login.microsoftonline.us';  mgEnvironment = 'USGov';    azCloud = 'AzureUSGovernment' }
+    USGovDoD = @{ graphEndpoint = 'https://dod-graph.microsoft.us'; loginHost = 'login.microsoftonline.us';  mgEnvironment = 'USGovDoD'; azCloud = 'AzureUSGovernment' }
 }
-if ($Environment -eq 'Custom') {
-    if (-not $CustomGraphEndpoint -or -not $CustomLoginHost) {
-        throw "-Environment Custom requires -CustomGraphEndpoint and -CustomLoginHost (e.g. an Azure Government/sovereign or AGC endpoint)."
+
+function Resolve-CloudConfig {
+    param([Parameter(Mandatory = $true)][string] $Name, [string] $ConfigPath)
+
+    $candidates = @()
+    if ($ConfigPath) { $candidates += $ConfigPath }
+    if ($PSScriptRoot) {
+        $candidates += (Join-Path (Split-Path $PSScriptRoot -Parent) 'Config/clouds.json')
+        $candidates += (Join-Path $PSScriptRoot 'Config/clouds.json')
+        $candidates += (Join-Path $PSScriptRoot 'clouds.json')
     }
-    $EnvMap['Custom'] = @{ GraphEndpoint = $CustomGraphEndpoint.TrimEnd('/'); Login = $CustomLoginHost; MgEnvironment = $CustomMgEnvironment }
+
+    $fileClouds = @{}
+    $foundPath  = $null
+    foreach ($c in $candidates) {
+        if ($c -and (Test-Path -LiteralPath $c)) { $foundPath = $c; break }
+    }
+    if ($foundPath) {
+        try { $doc = Get-Content -Raw -LiteralPath $foundPath | ConvertFrom-Json }
+        catch { throw "Cloud config '$foundPath' is not valid JSON: $($_.Exception.Message)" }
+        $node = if ($doc.PSObject.Properties.Name -contains 'clouds') { $doc.clouds } else { $doc }
+        foreach ($p in $node.PSObject.Properties) {
+            if ($p.Name -eq '$schema') { continue }
+            $h = @{}
+            foreach ($f in $p.Value.PSObject.Properties) { $h[$f.Name] = $f.Value }
+            $fileClouds[$p.Name] = $h
+        }
+    }
+
+    if     ($fileClouds.ContainsKey($Name))    { $entry = $fileClouds[$Name] }
+    elseif ($BuiltInClouds.ContainsKey($Name)) { $entry = $BuiltInClouds[$Name] }
+    else {
+        $known    = ((@($BuiltInClouds.Keys) + @($fileClouds.Keys)) | Select-Object -Unique | Sort-Object) -join ', '
+        $searched = ($candidates | Where-Object { $_ }) -join '; '
+        throw "Unknown -Environment '$Name'. Known clouds: $known. Define a custom/sovereign cloud in a clouds.json (searched: $searched)."
+    }
+    if ($entry.graphEndpoint) { $entry.graphEndpoint = ([string]$entry.graphEndpoint).TrimEnd('/') }
+    return $entry
 }
-$EnvCfg        = $EnvMap[$Environment]
-$GraphEndpoint = $EnvCfg.GraphEndpoint
-$LoginHost     = $EnvCfg.Login
+
+$EnvCfg        = Resolve-CloudConfig -Name $Environment -ConfigPath $CloudConfigPath
+$GraphEndpoint = $EnvCfg.graphEndpoint
+$LoginHost     = $EnvCfg.loginHost
+if (-not $GraphEndpoint -or -not $LoginHost -or -not $EnvCfg.mgEnvironment) {
+    throw "Cloud '$Environment' must define graphEndpoint, loginHost, and mgEnvironment (check your clouds.json)."
+}
 
 $script:Summary = [ordered]@{ Started = 0; AlreadyRunning = 0; NotReady = 0; WhatIf = 0; Error = 0 }
 

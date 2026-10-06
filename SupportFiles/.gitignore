@@ -1,0 +1,7 @@
+# Live partner allow-list carries real tenant IDs — keep it out of git.
+# Copy Config/partners.example.json to Config/partners.json and fill in real values locally.
+# (Config/clouds.json IS committed — it holds only cloud endpoints, no secrets.)
+Entra-TCG/Config/partners.json
+
+# Local deployer app IDs and certificate paths are session-specific.
+deployerAppConfig.json
